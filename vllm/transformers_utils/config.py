@@ -588,6 +588,20 @@ def get_sentence_transformer_tokenizer_config(model: str,
         return encoder_dict
     return None
 
+def enhance_config_with_quantization(config, model_path: str):
+    """Enhance model configuration with quantization information."""
+    from vllm.model_executor.model_loader.weight_utils import detect_gba_quantization
+
+    config_dict = config.to_dict()
+    is_gba, gba_config = detect_gba_quantization(str(model_path), config_dict)
+
+    if is_gba:
+        config_dict["quantization_config"] = gba_config
+        enhanced_config = config.__class__.from_dict(config_dict)
+        logger.info(f"Enhanced config with GBA quantization")
+        return enhanced_config
+
+    return config
 
 def maybe_register_config_serialize_by_value() -> None:
     """Try to register HF model configuration class to serialize by value

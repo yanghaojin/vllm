@@ -6,12 +6,13 @@ import glob
 import hashlib
 import json
 import os
+import re
 import tempfile
 import time
 from collections import defaultdict
 from collections.abc import Generator
 from pathlib import Path
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Union, Dict, Tuple
 
 import filelock
 import gguf
@@ -780,3 +781,214 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
 
     # If there were no matches, return the untouched param name
     return name
+
+
+
+def gba_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor,
+                      param_name: str) -> None:
+    """
+    GBA quantized weight loader.
+
+    This function handles special loading logic for GBA quantized weight parameters.
+    It supports both standard and mixed bit-width quantization modes.
+    """
+
+    def ensure_dtype(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        if tensor.dtype != dtype:
+            return tensor.to(dtype)
+        return tensor
+
+    def ensure_shape(tensor: torch.Tensor, target_shape: torch.Size, param_name: str) -> torch.Tensor:
+        """Ensure tensor has the correct shape, with fallback strategies"""
+        if tensor.shape == target_shape:
+            return tensor
+
+        # Try to reshape if same number of elements
+        if tensor.numel() == target_shape.numel():
+            logger.info(f"Reshaping {param_name} from {tensor.shape} to {target_shape}")
+            return tensor.view(target_shape)
+
+        # For quantized weights, handle potential packing differences
+        if "qweight" in param_name:
+            # Handle different bit-width packing
+            if tensor.numel() * 2 == target_shape.numel():
+                # Might be 2-bit vs 4-bit packing difference
+                logger.info(f"Handling bit-width packing difference for {param_name}")
+                return tensor.repeat_interleave(2, dim=0)[:target_shape[0]].view(target_shape)
+            elif tensor.numel() == target_shape.numel() * 2:
+                # Opposite case
+                logger.info(f"Handling bit-width packing difference for {param_name}")
+                return tensor[::2].view(target_shape)
+
+        logger.warning(
+            f"Shape mismatch for {param_name}: param {target_shape} vs loaded {tensor.shape}, "
+            f"using default loading"
+        )
+        return tensor
+
+    # Handle quantized weights (packed integers)
+    if "qweight" in param_name:
+        loaded_weight = ensure_dtype(loaded_weight, param.dtype)
+        loaded_weight = ensure_shape(loaded_weight, param.shape, param_name)
+
+    # Handle quantization scales
+    elif "qscales" in param_name or "scales" in param_name:
+        loaded_weight = ensure_dtype(loaded_weight, param.dtype)
+        loaded_weight = ensure_shape(loaded_weight, param.shape, param_name)
+
+    # Handle quantization zero-points
+    elif "qzeros" in param_name or "zeros" in param_name:
+        loaded_weight = ensure_dtype(loaded_weight, param.dtype)
+        loaded_weight = ensure_shape(loaded_weight, param.shape, param_name)
+
+    # Handle permutation indices for quantization
+    elif "q_perm" in param_name:
+        loaded_weight = ensure_dtype(loaded_weight, param.dtype)
+
+        # q_perm should be 1D and match input dimension
+        if loaded_weight.dim() != 1:
+            loaded_weight = loaded_weight.flatten()
+
+        if loaded_weight.shape != param.shape:
+            logger.warning(
+                f"q_perm shape mismatch: param {param.shape} vs loaded {loaded_weight.shape}"
+            )
+            # Truncate or pad as needed
+            if loaded_weight.numel() > param.numel():
+                loaded_weight = loaded_weight[:param.numel()].view(param.shape)
+            else:
+                # Pad with zeros or identity permutation
+                padded = torch.zeros(param.shape, dtype=loaded_weight.dtype, device=loaded_weight.device)
+                padded[:loaded_weight.numel()] = loaded_weight.flatten()
+                loaded_weight = padded
+
+    # Handle quantization group metadata (for mixed bit-width)
+    elif "q_groups" in param_name:
+        loaded_weight = ensure_dtype(loaded_weight, param.dtype)
+
+        # q_groups should be 1D with even number of elements (pairs of bits and indices)
+        if loaded_weight.dim() != 1:
+            loaded_weight = loaded_weight.flatten()
+
+        if loaded_weight.shape != param.shape:
+            logger.warning(
+                f"q_groups shape mismatch: param {param.shape} vs loaded {loaded_weight.shape}"
+            )
+            # Truncate or pad as needed
+            if loaded_weight.numel() > param.numel():
+                loaded_weight = loaded_weight[:param.numel()].view(param.shape)
+            else:
+                padded = torch.zeros(param.shape, dtype=loaded_weight.dtype, device=loaded_weight.device)
+                padded[:loaded_weight.numel()] = loaded_weight.flatten()
+                loaded_weight = padded
+
+    # Fallback to default loading mechanism
+    return default_weight_loader(param, loaded_weight)
+
+
+def load_gba_strategy_config(model_path: str) -> Optional[Dict[str, Any]]:
+    """
+    Load GBA quantization strategy configuration from model directory.
+
+    Args:
+        model_path: Path to the model directory
+
+    Returns:
+        Strategy configuration dictionary or None if not found
+    """
+    strategy_files = ["quant_strategy.json"]
+
+    for strategy_file in strategy_files:
+        strategy_path = os.path.join(model_path, strategy_file)
+        if os.path.exists(strategy_path):
+            try:
+                with open(strategy_path, "r") as f:
+                    config = json.load(f)
+
+                # Handle different config formats
+                if "measurement" in config:
+                    logger.info(f"Loaded GBA strategy config from {strategy_path}")
+                    return config["measurement"]
+                elif "strategy" in config:
+                    logger.info(f"Loaded GBA strategy config from {strategy_path}")
+                    return config["strategy"]
+                else:
+                    logger.info(f"Loaded GBA config from {strategy_path}")
+                    return config
+
+            except (json.JSONDecodeError, IOError) as e:
+                logger.warning(f"Failed to load strategy config from {strategy_path}: {e}")
+                continue
+
+    return None
+
+def detect_gba_quantization(model_path: str, config: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    """Detect if the model uses GBA quantization and extract configuration."""
+
+    # Check model name patterns
+    model_name = str(model_path)
+    is_gba_name = ("GreenBitAI" in model_name or
+                   "greenbit" in model_name.lower() or
+                   "layer-mix" in model_name or
+                   "channel-mix" in model_name)
+
+    # Check for strategy files if it's a local path
+    has_strategy_files = False
+    if os.path.isdir(model_path):
+        strategy_config = load_gba_strategy_config(model_path)
+        has_strategy_files = strategy_config is not None
+
+    is_gba_model = is_gba_name or has_strategy_files
+
+    if is_gba_model:
+        gba_config = {
+            "quantization_method": "gba",
+            "weight_bits": 4,
+            "group_size": 128,
+            "use_mbw": "layer-mix" in model_name or "channel-mix" in model_name
+        }
+
+        # Parse bit width and group size from model name
+        bpw_match = re.search(r'bpw-(\d+\.?\d*)', model_name)
+        if bpw_match:
+            gba_config["weight_bits"] = int(float(bpw_match.group(1)))
+
+        groupsize_match = re.search(r'groupsize(\d+)', model_name)
+        if groupsize_match:
+            gba_config["group_size"] = int(groupsize_match.group(1))
+
+        # Add strategy config if available
+        if os.path.isdir(model_path) and strategy_config:
+            gba_config["strategy"] = strategy_config
+
+        # Add MoE info
+        from vllm.model_executor.layers.quantization.gba_moe_support import detect_moe_model_type
+        class MockConfig:
+            def __init__(self, **kwargs):
+                for k, v in kwargs.items():
+                    setattr(self, k, v)
+
+        mock_config = MockConfig(**config)
+        moe_info = detect_moe_model_type(mock_config)
+        gba_config["moe_info"] = moe_info
+
+        return True, gba_config
+
+    return False, {}
+
+def should_use_gba_weight_loader(param_name: str) -> bool:
+    """
+    Determine if a parameter should use the GBA weight loader.
+
+    Args:
+        param_name: Name of the parameter
+
+    Returns:
+        True if should use GBA weight loader
+    """
+    gba_param_indicators = [
+        "qweight", "qscales", "qzeros", "q_perm", "q_groups",
+        "scales", "zeros"  # Alternative naming
+    ]
+
+    return any(indicator in param_name for indicator in gba_param_indicators)
