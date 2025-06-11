@@ -250,6 +250,7 @@ set(VLLM_EXT_SRC
   "csrc/quantization/fused_kernels/fused_layernorm_dynamic_per_token_quant.cu"
   "csrc/quantization/gguf/gguf_kernel.cu"
   "csrc/quantization/activation_kernels.cu"
+  "csrc/quantization/gba/gba_ops.cu"
   "csrc/cuda_utils_kernels.cu"
   "csrc/prepare_inputs/advance_step.cu"
   "csrc/custom_all_reduce.cu"
@@ -257,6 +258,12 @@ set(VLLM_EXT_SRC
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   SET(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
+
+  # Add GBA include directories for EXL2 headers
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantization/gba/exl2")
+    set(GBA_EXL2_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantization/gba/exl2")
+    message(STATUS "Found GBA EXL2 headers at: ${GBA_EXL2_INCLUDE_DIR}")
+  endif()
 
   # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages when building.
   set(CUTLASS_REVISION "v3.9.2" CACHE STRING "CUTLASS revision to use")
@@ -635,10 +642,36 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
                      "found in CUDA target architectures")
     endif()
   endif()
+
+    # GBA kernels - support common architectures
+  cuda_archs_loose_intersection(GBA_ARCHS "7.5;8.0;8.6;8.9+PTX" "${CUDA_ARCHS}")
+  if (GBA_ARCHS)
+    set(GBA_SRCS "csrc/quantization/gba/gba_ops.cu")
+
+    set_gencode_flags_for_srcs(
+      SRCS "${GBA_SRCS}"
+      CUDA_ARCHS "${GBA_ARCHS}")
+
+    message(STATUS "Building GBA kernels for archs: ${GBA_ARCHS}")
+  else()
+    message(STATUS "Not building GBA kernels as no compatible archs found"
+                   " in CUDA target architectures")
+  endif()
+
 # if CUDA endif
 endif()
 
 message(STATUS "Enabling C extension.")
+
+# Add GBA include directories if they exist
+set(GBA_INCLUDE_DIRS)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantization/gba")
+  list(APPEND GBA_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantization/gba")
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantization/gba/exl2")
+    list(APPEND GBA_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantization/gba/exl2")
+  endif()
+endif()
+
 define_gpu_extension_target(
   _C
   DESTINATION vllm
@@ -648,6 +681,7 @@ define_gpu_extension_target(
   ARCHITECTURES ${VLLM_GPU_ARCHES}
   INCLUDE_DIRECTORIES ${CUTLASS_INCLUDE_DIR}
   INCLUDE_DIRECTORIES ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
+  INCLUDE_DIRECTORIES ${GBA_INCLUDE_DIRS}
   USE_SABI 3
   WITH_SOABI)
 

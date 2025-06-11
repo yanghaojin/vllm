@@ -39,9 +39,9 @@ vllm/
 │    └── quantization/
 │        ├── gba_integration_validation.py # Integration tests and examples
 │        └── README.md                     # This file
-├── tests/
-│    └── quantization/
-│        └── test_gba.py                  # unit tests
+└── tests/
+    └── quantization/
+        └── test_gba.py                  # unit tests
 ```
 
 ## Quick Start
