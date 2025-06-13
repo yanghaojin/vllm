@@ -3,8 +3,6 @@
 #include "ops.h"
 #include "core/registration.h"
 
-#include "quantization/gba/gba_ops.h"
-
 #include <torch/library.h>
 #include <torch/version.h>
 
@@ -593,6 +591,28 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int pad_slot_id) -> ()");
   ops.impl("causal_conv1d_fwd", torch::kCUDA, &causal_conv1d_fwd);
 
+  // GBA's quantized ops
+  ops.def(
+    "gba_linear_forward(Tensor x, Tensor qweight, Tensor qscales, "
+    "Tensor qzeros, Tensor q_perm, int group_size, int bits, "
+    "bool use_mbw, Tensor q_group_map, int[] rows) -> Tensor",
+    {stride_tag});
+  ops.impl("gba_linear_forward", torch::kCUDA, &gba_linear_forward);
+
+  ops.def(
+    "gba_trans_qweight(Tensor qweight, Tensor q_groups, bool use_mbw, "
+    "int height, int groups, int bits) -> (Tensor, int[])");
+  ops.impl("gba_trans_qweight", torch::kCUDA, &gba_trans_qweight);
+
+  ops.def(
+    "gba_dequantize_weight(Tensor qweight, Tensor qscales, Tensor qzeros, "
+    "Tensor q_perm, int group_size, int bits, bool use_mbw, "
+    "Tensor q_group_map, int[] rows) -> Tensor");
+  ops.impl("gba_dequantize_weight", torch::kCUDA, &gba_dequantize_weight);
+
+  ops.def("make_group_map(Tensor q_groups, int num_qrows) -> Tensor");
+  ops.impl("make_group_map", torch::kCUDA, &make_group_map);
+
 #ifndef USE_ROCM
   // reorder weight for AllSpark Ampere W8A16 Fused Gemm kernel
   ops.def(
@@ -611,28 +631,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "CUBLAS_M_THRESHOLD, bool has_zp, bool n32k16_reorder) -> Tensor");
   //  conditionally compiled so impl in source file
 #endif
-
-  // GBA's quantized ops
-  ops.def(
-	  "gba_linear_forward(Tensor x, Tensor qweight, Tensor qscales, "
-      "Tensor qzeros, Tensor q_perm, int group_size, int bits, "
-      "bool use_mbw, Tensor? q_group_map, int[]? rows) -> Tensor",
-      {stride_tag});
-  ops.impl("gba_linear_forward", torch::kCUDA, &gba_linear_forward);
-
-  ops.def(
-	    "gba_trans_qweight(Tensor qweight, Tensor q_groups, bool use_mbw, "
-	    "int height, int groups, int bits) -> (Tensor, int[])");
-  ops.impl("gba_trans_qweight", torch::kCUDA, &gba_trans_qweight);
-
-  ops.def(
-	    "gba_dequantize_weight(Tensor qweight, Tensor qscales, Tensor qzeros, "
-	    "Tensor q_perm, int group_size, int bits, bool use_mbw, "
-	    "Tensor? q_group_map, int[]? rows) -> Tensor");
-  ops.impl("gba_dequantize_weight", torch::kCUDA, &gba_dequantize_weight);
-
-  ops.def("make_group_map(Tensor q_groups, int num_qrows) -> Tensor");
-  ops.impl("make_group_map", torch::kCUDA, &make_group_map);
 }
 
 TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {

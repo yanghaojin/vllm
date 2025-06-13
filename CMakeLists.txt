@@ -643,21 +643,6 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     endif()
   endif()
 
-    # GBA kernels - support common architectures
-  cuda_archs_loose_intersection(GBA_ARCHS "7.5;8.0;8.6;8.9+PTX" "${CUDA_ARCHS}")
-  if (GBA_ARCHS)
-    set(GBA_SRCS "csrc/quantization/gba/gba_ops.cu")
-
-    set_gencode_flags_for_srcs(
-      SRCS "${GBA_SRCS}"
-      CUDA_ARCHS "${GBA_ARCHS}")
-
-    message(STATUS "Building GBA kernels for archs: ${GBA_ARCHS}")
-  else()
-    message(STATUS "Not building GBA kernels as no compatible archs found"
-                   " in CUDA target architectures")
-  endif()
-
 # if CUDA endif
 endif()
 

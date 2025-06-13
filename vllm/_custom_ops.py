@@ -1780,3 +1780,59 @@ def cutlass_mla_decode(out: torch.Tensor, q_nope: torch.Tensor,
     torch.ops._C.cutlass_mla_decode(out, q_nope, q_pe, kv_c_and_k_pe_cache,
                                     seq_lens, page_table, scale)
     return out
+
+# GBA quantization ops
+def gba_linear_forward(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    qscales: torch.Tensor,
+    qzeros: torch.Tensor,
+    q_perm: torch.Tensor,
+    group_size: int,
+    bits: int,
+    use_mbw: bool,
+    q_group_map: torch.Tensor = None,
+    rows: list = None,
+) -> torch.Tensor:
+    """GBA quantized linear forward operation."""
+    return torch.ops._C.gba_linear_forward(
+        x, qweight, qscales, qzeros, q_perm, group_size, bits, use_mbw,
+        q_group_map, rows
+    )
+
+
+def gba_trans_qweight(
+    qweight: torch.Tensor,
+    q_groups: torch.Tensor,
+    use_mbw: bool,
+    height: int,
+    groups: int,
+    bits: int,
+) -> tuple[torch.Tensor, list]:
+    """Transform GBA quantized weights."""
+    return torch.ops._C.gba_trans_qweight(
+        qweight, q_groups, use_mbw, height, groups, bits
+    )
+
+
+def gba_dequantize_weight(
+    qweight: torch.Tensor,
+    qscales: torch.Tensor,
+    qzeros: torch.Tensor,
+    q_perm: torch.Tensor,
+    group_size: int,
+    bits: int,
+    use_mbw: bool,
+    q_group_map: torch.Tensor = None,
+    rows: list = None,
+) -> torch.Tensor:
+    """Dequantize GBA quantized weights."""
+    return torch.ops._C.gba_dequantize_weight(
+        qweight, qscales, qzeros, q_perm, group_size, bits, use_mbw,
+        q_group_map, rows
+    )
+
+
+def make_group_map(q_groups: torch.Tensor, num_qrows: int) -> torch.Tensor:
+    """Create group mapping for GBA quantization."""
+    return torch.ops._C.make_group_map(q_groups, num_qrows)

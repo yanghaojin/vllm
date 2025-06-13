@@ -1,22 +1,23 @@
-#include "gba_ops.h"
-#include <torch/extension.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#include <torch/all.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/torch.h>
 #include <ATen/ATen.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
+
+#include <cuda_bf16.h>
+#include <curand_kernel.h>
+
 #include <vector>
 #include <utility>
 #include <chrono>
+#include <cstring>
 #include <string.h>
 #include <iostream>
 #include <algorithm>
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
 #include <cmath>
-#include <curand_kernel.h>
 #include <tuple>
-#include <bits/stdc++.h>
 
 #include "exl2/matrix_view.cuh"
 #include "exl2/util.cuh"
@@ -1011,13 +1012,21 @@ torch::Tensor gba_linear_forward(
     torch::Tensor qscales,
     torch::Tensor qzeros,
     torch::Tensor q_perm,
-    int group_size,
-    int bits,
+    int64_t group_size_64,
+    int64_t bits_64,
     bool use_mbw,
     torch::Tensor q_group_map,
-    std::vector<int> rows) {
+    std::vector<int64_t> rows_64) {
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
+
+    int group_size = static_cast<int>(group_size_64);
+    int bits = static_cast<int>(bits_64);
+    std::vector<int> rows;
+    rows.reserve(rows_64.size());
+    for (int64_t val : rows_64) {
+        rows.push_back(static_cast<int>(val));
+    }
 
     if (!use_mbw) {
         // 标准量化模式
@@ -1032,15 +1041,28 @@ torch::Tensor gba_linear_forward(
     }
 }
 
-std::pair<torch::Tensor, std::vector<int>> gba_trans_qweight(
+std::tuple<torch::Tensor, std::vector<int64_t>> gba_trans_qweight(
     torch::Tensor qweight,
     torch::Tensor q_groups,
     bool use_mbw,
-    int height,
-    int groups,
-    int bits) {
+    int64_t height_64,
+    int64_t groups_64,
+    int64_t bits_64) {
 
-    return mbwq_linear_trans_qweight_cuda(qweight, q_groups, use_mbw, height, groups, bits);
+    int height = static_cast<int>(height_64);
+    int groups = static_cast<int>(groups_64);
+    int bits = static_cast<int>(bits_64);
+
+    auto result = mbwq_linear_trans_qweight_cuda(qweight, q_groups, use_mbw, height, groups, bits);
+
+    // cast to int64_t
+    std::vector<int64_t> rows_64;
+    rows_64.reserve(result.second.size());
+    for (int val : result.second) {
+        rows_64.push_back(static_cast<int64_t>(val));
+    }
+
+    return std::make_tuple(result.first, rows_64);
 }
 
 torch::Tensor gba_dequantize_weight(
@@ -1048,11 +1070,19 @@ torch::Tensor gba_dequantize_weight(
     torch::Tensor qscales,
     torch::Tensor qzeros,
     torch::Tensor q_perm,
-    int group_size,
-    int bits,
+    int64_t group_size_64,
+    int64_t bits_64,
     bool use_mbw,
     torch::Tensor q_group_map,
-    std::vector<int> rows) {
+    std::vector<int64_t> rows_64) {
+
+    int group_size = static_cast<int>(group_size_64);
+    int bits = static_cast<int>(bits_64);
+    std::vector<int> rows;
+    rows.reserve(rows_64.size());
+    for (int64_t val : rows_64) {
+        rows.push_back(static_cast<int>(val));
+    }
 
     if (!use_mbw) {
         return mbwq_linear_q42fp_weight_cuda(qweight, qscales, qzeros, group_size, bits, q_perm);
@@ -1061,7 +1091,9 @@ torch::Tensor gba_dequantize_weight(
     }
 }
 
-torch::Tensor make_group_map(torch::Tensor q_groups, int num_qrows) {
+torch::Tensor make_group_map(torch::Tensor q_groups, int64_t num_qrows_64) {
+
+	int num_qrows = static_cast<int>(num_qrows_64);
 
     int num_groups = q_groups.numel() / 2;
     std::vector<int> group_map;
