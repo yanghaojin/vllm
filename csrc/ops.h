@@ -350,3 +350,39 @@ std::tuple<int64_t, torch::Tensor> allocate_shared_buffer_and_handle(
     int64_t size);
 int64_t open_mem_handle(torch::Tensor& mem_handle);
 void free_shared_buffer(int64_t buffer);
+
+// GBA quantization operations
+torch::Tensor gba_linear_forward(
+    torch::Tensor x,
+    torch::Tensor qweight,
+    torch::Tensor qscales,
+    torch::Tensor qzeros,
+    torch::Tensor q_perm,
+    int64_t group_size,
+    int64_t bits,
+    bool use_mbw,
+    torch::Tensor q_group_map,
+    std::vector<int64_t> rows);
+
+std::tuple<torch::Tensor, std::vector<int64_t>> gba_trans_qweight(
+    torch::Tensor qweight,
+    torch::Tensor q_groups,
+    bool use_mbw,
+    int64_t height,
+    int64_t groups,
+    int64_t bits);
+
+torch::Tensor gba_dequantize_weight(
+    torch::Tensor qweight,
+    torch::Tensor qscales,
+    torch::Tensor qzeros,
+    torch::Tensor q_perm,
+    int64_t group_size,
+    int64_t bits,
+    bool use_mbw,
+    torch::Tensor q_group_map,
+    std::vector<int64_t> rows);
+
+torch::Tensor make_group_map(
+    torch::Tensor q_groups,
+    int64_t num_qrows);

@@ -170,9 +170,9 @@ class GBALinearMethod(LinearMethodBase):
             set_weight_attrs(q_groups, {"input_dim": -1, "output_dim": -1})
             layer.register_parameter("q_groups", q_groups)
 
-            # Group mapping and row information (created in prepare_weights)
-            layer.register_buffer("q_group_map", None)
-            layer.register_buffer("rows_info", None)
+        # Group mapping and row information (created in prepare_weights)
+        layer.register_buffer("q_group_map", torch.empty(0, dtype=torch.int32))
+        layer.register_buffer("rows_info", torch.empty(0, dtype=torch.int32))
 
         # Register all parameters
         layer.register_parameter("qweight", qweight)
@@ -222,7 +222,10 @@ class GBALinearMethod(LinearMethodBase):
                 self.quant_config.weight_bits,
             )
             layer.qweight.data = qweight
-            layer.rows_info = rows
+            if isinstance(rows, list) and len(rows) > 0:
+                layer.rows_info = rows
+            else:
+                layer.rows_info = torch.empty(0, dtype=torch.int32, device=layer.qweight.device)
 
             # Create group mapping
             layer.q_group_map = ops.make_group_map(layer.q_groups, layer.qweight.size(0))
@@ -231,7 +234,7 @@ class GBALinearMethod(LinearMethodBase):
 
         else:
             # Standard quantization mode
-            qweight, _ = ops.gba_trans_qweight(
+            qweight, rows = ops.gba_trans_qweight(
                 layer.qweight,
                 torch.empty(1, dtype=torch.int16, device=layer.qweight.device),
                 False, # use_mbw=False
@@ -240,6 +243,11 @@ class GBALinearMethod(LinearMethodBase):
                 self.quant_config.weight_bits,
             )
             layer.qweight.data = qweight
+
+            if isinstance(rows, list) and len(rows) > 0:
+                layer.rows_info = torch.tensor(rows, dtype=torch.int32, device=layer.qweight.device)
+            else:
+                layer.rows_info = torch.empty(0, dtype=torch.int32, device=layer.qweight.device)
 
             logger.info("Applied standard quantization")
 
@@ -262,6 +270,11 @@ class GBALinearMethod(LinearMethodBase):
         q_group_map = getattr(layer, "q_group_map", None)
         rows_info = getattr(layer, "rows_info", None)
 
+        if rows_info is not None and rows_info.numel() > 0:
+            rows_list = rows_info.tolist()
+        else:
+            rows_list = []  # Empty list instead of None
+
         # Call CUDA forward propagation
         output = ops.gba_linear_forward(
             x,
@@ -273,7 +286,7 @@ class GBALinearMethod(LinearMethodBase):
             self.quant_config.weight_bits,
             self.quant_config.use_mbw,
             q_group_map,
-            rows_info,
+            rows_list,
         )
 
         # Add bias
