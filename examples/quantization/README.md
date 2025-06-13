@@ -31,7 +31,6 @@ vllm/
 ├── csrc/
 │   ├── quantization/
 │   │   └── gba/
-│   │       ├── gba_ops.h                # CUDA operations header
 │   │       ├── gba_ops.cu               # CUDA kernel implementations
 │   │       └── exl2/...                 # Exl2 cuda kernel implementations
 │   └── torch_bindings.cpp               # PyTorch bindings (modified)
