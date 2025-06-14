@@ -383,6 +383,12 @@ def get_config(
     if trust_remote_code:
         maybe_register_config_serialize_by_value()
 
+    # 新增：尝试增强配置以支持 GBA 量化
+    try:
+        config = enhance_config_with_quantization(config, str(model))
+    except Exception as e:
+        logger.debug(f"Config enhancement failed: {e}")
+
     return config
 
 
@@ -596,10 +602,24 @@ def enhance_config_with_quantization(config, model_path: str):
     is_gba, gba_config = detect_gba_quantization(str(model_path), config_dict)
 
     if is_gba:
+        # 直接在 config_dict 中设置 quantization_config
         config_dict["quantization_config"] = gba_config
-        enhanced_config = config.__class__.from_dict(config_dict)
-        logger.info(f"Enhanced config with GBA quantization")
-        return enhanced_config
+        config_dict["quantization"] = "gba"
+
+        # 重新创建配置对象
+        try:
+            enhanced_config = config.__class__.from_dict(config_dict)
+            logger.info(
+                f"Enhanced config with GBA quantization: "
+                f"bits={gba_config.get('weight_bits', 4)}, "
+                f"group_size={gba_config.get('group_size', 128)}")
+            return enhanced_config
+        except Exception as e:
+            logger.warning(f"Failed to create enhanced config: {e}, using original config")
+            # 直接设置属性作为备选方案
+            config.quantization_config = gba_config
+            logger.info(f"Set quantization_config attribute directly")
+            return config
 
     return config
 
