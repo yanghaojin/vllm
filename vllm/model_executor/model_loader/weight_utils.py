@@ -156,7 +156,9 @@ def get_quant_config(model_config: ModelConfig,
 
         if is_gba:
             from vllm.model_executor.layers.quantization.gba import GBAConfig
-            logger.info(f"Creating GBA config: {gba_config_dict}")
+
+            # logger.info(f"Creating GBA config: {gba_config_dict}")
+
             return GBAConfig.from_config(gba_config_dict)
 
     # Try automatic GBA detection if not explicitly set
@@ -808,132 +810,6 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
     return name
 
 
-
-def gba_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor,
-                      param_name: str) -> None:
-    """
-    GBA quantized weight loader.
-
-    This function handles special loading logic for GBA quantized weight parameters.
-    It supports both standard and mixed bit-width quantization modes.
-    """
-
-    def ensure_dtype(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-        if tensor.dtype != dtype:
-            return tensor.to(dtype)
-        return tensor
-
-    def ensure_shape(tensor: torch.Tensor, target_shape: torch.Size, param_name: str) -> torch.Tensor:
-        """Ensure tensor has the correct shape, with fallback strategies"""
-        if tensor.shape == target_shape:
-            return tensor
-
-        # Try to reshape if same number of elements
-        if tensor.numel() == target_shape.numel():
-            logger.info(f"Reshaping {param_name} from {tensor.shape} to {target_shape}")
-            return tensor.view(target_shape)
-
-        # For quantized weights, handle potential packing differences
-        if "qweight" in param_name:
-            # Handle different bit-width packing
-            if tensor.numel() * 2 == target_shape.numel():
-                # Might be 2-bit vs 4-bit packing difference
-                logger.info(f"Handling bit-width packing difference for {param_name}")
-                return tensor.repeat_interleave(2, dim=0)[:target_shape[0]].view(target_shape)
-            elif tensor.numel() == target_shape.numel() * 2:
-                # Opposite case
-                logger.info(f"Handling bit-width packing difference for {param_name}")
-                return tensor[::2].view(target_shape)
-
-        logger.warning(
-            f"Shape mismatch for {param_name}: param {target_shape} vs loaded {tensor.shape}, "
-            f"using default loading"
-        )
-        return tensor
-
-    # Handle quantized weights (packed integers)
-    if "qweight" in param_name:
-        loaded_weight = ensure_dtype(loaded_weight, param.dtype)
-        loaded_weight = ensure_shape(loaded_weight, param.shape, param_name)
-
-    # Handle quantization scales
-    elif "qscales" in param_name or "scales" in param_name:
-        loaded_weight = ensure_dtype(loaded_weight, param.dtype)
-        loaded_weight = ensure_shape(loaded_weight, param.shape, param_name)
-
-    # Handle quantization zero-points
-    elif "qzeros" in param_name or "zeros" in param_name:
-        loaded_weight = ensure_dtype(loaded_weight, param.dtype)
-        loaded_weight = ensure_shape(loaded_weight, param.shape, param_name)
-
-    # Handle permutation indices for quantization
-    elif "q_perm" in param_name:
-        loaded_weight = ensure_dtype(loaded_weight, param.dtype)
-
-        # q_perm should be 1D and match input dimension
-        if loaded_weight.dim() != 1:
-            loaded_weight = loaded_weight.flatten()
-
-        if loaded_weight.shape != param.shape:
-            logger.warning(
-                f"q_perm shape mismatch: param {param.shape} vs loaded {loaded_weight.shape}"
-            )
-            # Truncate or pad as needed
-            if loaded_weight.numel() > param.numel():
-                loaded_weight = loaded_weight[:param.numel()].view(param.shape)
-            else:
-                # Pad with zeros or identity permutation
-                padded = torch.zeros(param.shape, dtype=loaded_weight.dtype, device=loaded_weight.device)
-                padded[:loaded_weight.numel()] = loaded_weight.flatten()
-                loaded_weight = padded
-
-    # Handle quantization group metadata (for mixed bit-width)
-    elif "q_groups" in param_name:
-        loaded_weight = ensure_dtype(loaded_weight, param.dtype)
-
-        # q_groups should be 1D with even number of elements (pairs of bits and indices)
-        if loaded_weight.dim() != 1:
-            loaded_weight = loaded_weight.flatten()
-
-        if loaded_weight.shape != param.shape:
-            logger.warning(
-                f"q_groups shape mismatch: param {param.shape} vs loaded {loaded_weight.shape}"
-            )
-            # Truncate or pad as needed
-            if loaded_weight.numel() > param.numel():
-                loaded_weight = loaded_weight[:param.numel()].view(param.shape)
-            else:
-                padded = torch.zeros(param.shape, dtype=loaded_weight.dtype, device=loaded_weight.device)
-                padded[:loaded_weight.numel()] = loaded_weight.flatten()
-                loaded_weight = padded
-    elif "channel_scale" in param_name:
-        loaded_weight = ensure_dtype(loaded_weight, param.dtype)
-
-        # channel_scale 的期望形状是 (1, 1, input_size)
-        if loaded_weight.dim() == 1:
-            # 如果加载的权重是1D，reshape为 (1, 1, input_size)
-            loaded_weight = loaded_weight.reshape(1, 1, -1)
-        elif loaded_weight.dim() == 2:
-            # 如果是2D，可能需要调整
-            if loaded_weight.shape[0] == 1:
-                loaded_weight = loaded_weight.reshape(1, 1, -1)
-
-        # 确保形状匹配
-        if loaded_weight.shape != param.shape:
-            logger.warning(
-                f"channel_scale shape mismatch: param {param.shape} vs loaded {loaded_weight.shape}, "
-                f"attempting to reshape"
-            )
-            if loaded_weight.numel() == param.numel():
-                loaded_weight = loaded_weight.reshape(param.shape)
-            else:
-                logger.warning(f"Cannot reshape channel_scale, using default values")
-                return default_weight_loader(param, torch.ones_like(param))
-
-    # Fallback to default loading mechanism
-    return default_weight_loader(param, loaded_weight)
-
-
 def load_gba_strategy_config(model_path: str) -> Optional[Dict[str, Any]]:
     """
     Load GBA quantization strategy configuration from model directory.
@@ -1076,20 +952,3 @@ def detect_gba_quantization(model_path: str, config: Dict[str, Any]) -> Tuple[bo
         return True, gba_config
 
     return False, {}
-
-def should_use_gba_weight_loader(param_name: str) -> bool:
-    """
-    Determine if a parameter should use the GBA weight loader.
-
-    Args:
-        param_name: Name of the parameter
-
-    Returns:
-        True if should use GBA weight loader
-    """
-    gba_param_indicators = [
-        "qweight", "scales", "zeros", "q_perm", "q_groups",
-        "qscales", "qzeros", "channel_scale"  # Alternative naming
-    ]
-
-    return any(indicator in param_name for indicator in gba_param_indicators)

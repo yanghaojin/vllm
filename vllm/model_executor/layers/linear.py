@@ -292,7 +292,8 @@ class ReplicatedLinear(LinearBase):
                                          self.input_size,
                                          self.output_size,
                                          self.params_dtype,
-                                         weight_loader=self.weight_loader)
+                                         weight_loader=self.weight_loader,
+                                         prefix=prefix)
 
         if bias:
             self.bias = Parameter(
@@ -305,6 +306,35 @@ class ReplicatedLinear(LinearBase):
             self.register_parameter("bias", None)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+
+        if (hasattr(self, 'quant_method') and
+                self.quant_method is not None and
+                self.quant_method.__class__.__name__ == "GBALinearMethod"):
+
+            # 获取参数名
+            param_name = None
+            for name, p in self.named_parameters():
+                if p is param:
+                    param_name = name
+                    break
+
+            if param_name is None:
+                # 根据参数特征推断名称
+                if param.dtype == torch.int32:
+                    param_name = "qweight"
+                elif param.dtype == torch.int16:
+                    param_name = "q_perm" if param.dim() == 1 else "q_groups"
+                elif param.dim() == 3:
+                    param_name = "channel_scale"
+                else:
+                    param_name = "scales" if "scale" in str(param.shape) else "zeros"
+
+            logger.info(f"GBA ReplicatedLinear loading parameter: {param_name}")
+
+            # 使用GBA权重加载器
+            from vllm.model_executor.model_loader.weight_utils import gba_weight_loader
+            return gba_weight_loader(param, loaded_weight, param_name)
+
         # If the weight on disk does not have a shape, give it one
         # (such scales for AutoFp8).
         # Special case for GGUF
@@ -417,7 +447,9 @@ class ColumnParallelLinear(LinearBase):
             params_dtype=self.params_dtype,
             weight_loader=(
                 self.weight_loader_v2 if self.quant_method.__class__.__name__
-                in WEIGHT_LOADER_V2_SUPPORTED else self.weight_loader))
+                in WEIGHT_LOADER_V2_SUPPORTED else self.weight_loader),
+            prefix=prefix
+        )
         if bias:
             self.bias = Parameter(
                 torch.empty(self.output_size_per_partition,
@@ -470,6 +502,35 @@ class ColumnParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: Parameter, loaded_weight: torch.Tensor):
+
+        if (hasattr(self, 'quant_method') and
+                self.quant_method is not None and
+                self.quant_method.__class__.__name__ == "GBALinearMethod"):
+
+            # 获取参数名
+            param_name = None
+            for name, p in self.named_parameters():
+                if p is param:
+                    param_name = name
+                    break
+
+            if param_name is None:
+                # 根据参数特征推断名称
+                if param.dtype == torch.int32:
+                    param_name = "qweight"
+                elif param.dtype == torch.int16:
+                    param_name = "q_perm" if param.dim() == 1 else "q_groups"
+                elif param.dim() == 3:
+                    param_name = "channel_scale"
+                else:
+                    param_name = "scales" if "scale" in str(param.shape) else "zeros"
+
+            logger.info(f"GBA ColumnParallelLinear loading parameter: {param_name}")
+
+            # 使用GBA权重加载器
+            from vllm.model_executor.model_loader.weight_utils import gba_weight_loader
+            return gba_weight_loader(param, loaded_weight, param_name)
+
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
         if len(loaded_weight.shape) == 0:
@@ -1206,7 +1267,9 @@ class RowParallelLinear(LinearBase):
             params_dtype=self.params_dtype,
             weight_loader=(
                 self.weight_loader_v2 if self.quant_method.__class__.__name__
-                in WEIGHT_LOADER_V2_SUPPORTED else self.weight_loader))
+                in WEIGHT_LOADER_V2_SUPPORTED else self.weight_loader),
+            prefix=prefix
+        )
         if not reduce_results and (bias and not skip_bias_add):
             raise ValueError("When not reduce the results, adding bias to the "
                              "results can lead to incorrect results")
@@ -1261,6 +1324,34 @@ class RowParallelLinear(LinearBase):
 
     def weight_loader_v2(self, param: BasevLLMParameter,
                          loaded_weight: torch.Tensor):
+
+        if (hasattr(self, 'quant_method') and
+                self.quant_method is not None and
+                self.quant_method.__class__.__name__ == "GBALinearMethod"):
+
+            # 获取参数名
+            param_name = None
+            for name, p in self.named_parameters():
+                if p is param:
+                    param_name = name
+                    break
+
+            if param_name is None:
+                # 根据参数特征推断名称
+                if param.dtype == torch.int32:
+                    param_name = "qweight"
+                elif param.dtype == torch.int16:
+                    param_name = "q_perm" if param.dim() == 1 else "q_groups"
+                elif param.dim() == 3:
+                    param_name = "channel_scale"
+                else:
+                    param_name = "scales" if "scale" in str(param.shape) else "zeros"
+
+            logger.info(f"GBA RowParallelLinear loading parameter: {param_name}")
+
+            # 使用GBA权重加载器
+            from vllm.model_executor.model_loader.weight_utils import gba_weight_loader
+            return gba_weight_loader(param, loaded_weight, param_name)
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).

@@ -47,7 +47,7 @@ class GBAConfig(QuantizationConfig):
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
-        return ["quantize_config.json", "quant_strategy.json"]
+        return ["quant_strategy.json"]
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "GBAConfig":
@@ -61,7 +61,7 @@ class GBAConfig(QuantizationConfig):
         # Handle model name based detection
         if "_name_or_path" in config:
             model_name = config["_name_or_path"]
-            if "layer-mix" in model_name or "channel-mix" in model_name:
+            if "channel-mix" in model_name:
                 use_mbw = True
 
             # Parse parameters from model name
@@ -127,6 +127,18 @@ class GBALinearMethod(LinearMethodBase):
 
         # layer specific config
         layer_prefix = extra_weight_attrs.get("prefix", "")
+
+        if not layer_prefix:
+            # 尝试获取层的完整名称
+            if hasattr(layer, '_get_name'):
+                layer_prefix = layer._get_name()
+            elif hasattr(layer, '__class__'):
+                # 最后的备选方案：使用类名，但这不是最佳选择
+                layer_prefix = layer.__class__.__name__
+                logger.warning(f"Using class name as prefix: {layer_prefix}. "
+                               "Consider providing full layer path for better strategy matching.")
+
+        logger.info(f"Creating GBA weights for layer: {layer_prefix}")
         layer_config = self._get_layer_config(layer_prefix)
 
         logger.debug(f"layer config: {layer_config},"
@@ -134,6 +146,8 @@ class GBALinearMethod(LinearMethodBase):
 
         weight_bits = layer_config.get("weight_bits", self.quant_config.weight_bits)
         group_size = layer_config.get("group_size", self.quant_config.group_size)
+
+        logger.info(layer_config)
 
         if group_size == -1:
             group_size = input_size_per_partition
@@ -154,35 +168,51 @@ class GBALinearMethod(LinearMethodBase):
             torch.empty(qweight_shape, dtype=torch.int32, device="cuda"),
             requires_grad=False,
         )
-        set_weight_attrs(qweight, {"input_dim": 0, "output_dim": 1})
+        set_weight_attrs(qweight, {
+            "input_dim": 0,
+            "output_dim": 1,
+            "weight_loader": self._get_gba_weight_loader()
+        })
 
         # Create quantization scales and zero points
         scale_zero_shape = (num_groups, output_size_per_partition)
 
-        qscales = torch.nn.Parameter(
+        scales = torch.nn.Parameter(
             torch.empty(scale_zero_shape, dtype=params_dtype, device="cuda"),
             requires_grad=False,
         )
-        set_weight_attrs(qscales, {"input_dim": 0, "output_dim": 1})
+        set_weight_attrs(scales, {"input_dim": 0, "output_dim": 1})
 
-        qzeros = torch.nn.Parameter(
+        zeros = torch.nn.Parameter(
             torch.empty(scale_zero_shape, dtype=params_dtype, device="cuda"),
             requires_grad=False,
         )
-        set_weight_attrs(qzeros, {"input_dim": 0, "output_dim": 1})
+        set_weight_attrs(zeros, {
+            "input_dim": 0,
+            "output_dim": 1,
+            "weight_loader": self._get_gba_weight_loader()
+        })
 
         # Create permutation indices
         q_perm = torch.nn.Parameter(
             torch.empty(input_size_per_partition, dtype=torch.int16, device="cuda"),
             requires_grad=False,
         )
-        set_weight_attrs(q_perm, {"input_dim": 0, "output_dim": -1})
+        set_weight_attrs(q_perm, {
+            "input_dim": 0,
+            "output_dim": -1,
+            "weight_loader": self._get_gba_weight_loader()
+        })
 
         channel_scale = torch.nn.Parameter(
             torch.ones((1, 1, input_size_per_partition), dtype=params_dtype, device="cuda"),
             requires_grad=False,
         )
-        set_weight_attrs(channel_scale, {"input_dim": 2, "output_dim": -1})
+        set_weight_attrs(channel_scale, {
+            "input_dim": 2,
+            "output_dim": -1,
+            "weight_loader": self._get_gba_weight_loader()
+        })
         layer.register_parameter("channel_scale", channel_scale)
 
         # Mixed bit-width mode requires additional parameters
@@ -192,7 +222,11 @@ class GBALinearMethod(LinearMethodBase):
                 torch.empty(num_groups * 2, dtype=torch.int16, device="cuda"),
                 requires_grad=False,
             )
-            set_weight_attrs(q_groups, {"input_dim": -1, "output_dim": -1})
+            set_weight_attrs(q_groups, {
+                "input_dim": -1,
+                "output_dim": -1,
+                "weight_loader": self._get_gba_weight_loader()
+            })
             layer.register_parameter("q_groups", q_groups)
 
         # Group mapping and row information (created in prepare_weights)
@@ -201,8 +235,8 @@ class GBALinearMethod(LinearMethodBase):
 
         # Register all parameters
         layer.register_parameter("qweight", qweight)
-        layer.register_parameter("scales", qscales)
-        layer.register_parameter("zeros", qzeros)
+        layer.register_parameter("scales", scales)
+        layer.register_parameter("zeros", zeros)
         layer.register_parameter("q_perm", q_perm)
 
         # Store configuration
@@ -212,9 +246,150 @@ class GBALinearMethod(LinearMethodBase):
         layer.weight_bits = weight_bits
 
         layer._gba_weights_initialized = True
-        logger.debug(f"Created GBA weights for layer with shapes: "
-                     f"qweight={qweight_shape}, "
-                     f"scales={scale_zero_shape}")
+        logger.info(f"Created GBA weights for layer {layer_prefix} with shapes: "
+                    f"qweight={qweight_shape}, "
+                    f"scales={scale_zero_shape}")
+
+    def _get_gba_weight_loader(self):
+        """Get GBA-specific weight loader function"""
+
+        def gba_weight_loader_wrapper(param: torch.nn.Parameter, loaded_weight: torch.Tensor):
+            param_name = None
+            # Try to get parameter name from the parameter itself or its context
+            for name, p in param.named_parameters() if hasattr(param, 'named_parameters') else []:
+                if p is param:
+                    param_name = name
+                    break
+
+            if param_name is None:
+                # Fallback: infer from parameter attributes or tensor properties
+                if hasattr(param, '_param_name'):
+                    param_name = param._param_name
+                else:
+                    # Guess based on tensor properties
+                    if param.dtype == torch.int32:
+                        param_name = "qweight"
+                    elif param.dtype == torch.int16:
+                        param_name = "q_perm" if param.dim() == 1 else "q_groups"
+                    elif "scale" in str(param.shape):
+                        param_name = "scales"
+                    else:
+                        param_name = "unknown"
+
+            logger.info(f"GBA weight loader called for parameter: {param_name}, "
+                        f"param shape: {param.shape}, loaded shape: {loaded_weight.shape}")
+
+            return self._gba_weight_loader(param, loaded_weight, param_name)
+
+        return gba_weight_loader_wrapper
+
+    def _gba_weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor, param_name: str) -> None:
+        """
+        GBA quantized weight loader implementation.
+        """
+        logger.info(
+            f"Loading GBA weight: {param_name}, param shape: {param.shape}, loaded shape: {loaded_weight.shape}")
+
+        def ensure_dtype(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+            if tensor.dtype != dtype:
+                return tensor.to(dtype)
+            return tensor
+
+        def ensure_shape(tensor: torch.Tensor, target_shape: torch.Size, param_name: str) -> torch.Tensor:
+            """Ensure tensor has the correct shape, with fallback strategies"""
+            if tensor.shape == target_shape:
+                return tensor
+
+            # Try to reshape if same number of elements
+            if tensor.numel() == target_shape.numel():
+                logger.info(f"Reshaping {param_name} from {tensor.shape} to {target_shape}")
+                return tensor.view(target_shape)
+
+            # For quantized weights, handle potential packing differences
+            if "qweight" in param_name:
+                # Handle different bit-width packing
+                if tensor.numel() * 2 == target_shape.numel():
+                    logger.info(f"Handling bit-width packing difference for {param_name}")
+                    return tensor.repeat_interleave(2, dim=0)[:target_shape[0]].view(target_shape)
+                elif tensor.numel() == target_shape.numel() * 2:
+                    logger.info(f"Handling bit-width packing difference for {param_name}")
+                    return tensor[::2].view(target_shape)
+
+            logger.warning(
+                f"Shape mismatch for {param_name}: param {target_shape} vs loaded {tensor.shape}, "
+                f"attempting default loading"
+            )
+            return tensor
+
+        # Handle different parameter types
+        if "qweight" in param_name:
+            loaded_weight = ensure_dtype(loaded_weight, param.dtype)
+            loaded_weight = ensure_shape(loaded_weight, param.shape, param_name)
+
+        elif "scales" in param_name or "qscales" in param_name:
+            loaded_weight = ensure_dtype(loaded_weight, param.dtype)
+            loaded_weight = ensure_shape(loaded_weight, param.shape, param_name)
+
+        elif "zeros" in param_name or "qzeros" in param_name:
+            loaded_weight = ensure_dtype(loaded_weight, param.dtype)
+            loaded_weight = ensure_shape(loaded_weight, param.shape, param_name)
+
+        elif "q_perm" in param_name:
+            loaded_weight = ensure_dtype(loaded_weight, param.dtype)
+            if loaded_weight.dim() != 1:
+                loaded_weight = loaded_weight.flatten()
+            if loaded_weight.shape != param.shape:
+                logger.warning(f"q_perm shape mismatch: param {param.shape} vs loaded {loaded_weight.shape}")
+                if loaded_weight.numel() > param.numel():
+                    loaded_weight = loaded_weight[:param.numel()].view(param.shape)
+                else:
+                    padded = torch.zeros(param.shape, dtype=loaded_weight.dtype, device=loaded_weight.device)
+                    padded[:loaded_weight.numel()] = loaded_weight.flatten()
+                    loaded_weight = padded
+
+        elif "q_groups" in param_name:
+            loaded_weight = ensure_dtype(loaded_weight, param.dtype)
+            if loaded_weight.dim() != 1:
+                loaded_weight = loaded_weight.flatten()
+            if loaded_weight.shape != param.shape:
+                logger.warning(f"q_groups shape mismatch: param {param.shape} vs loaded {loaded_weight.shape}")
+                if loaded_weight.numel() > param.numel():
+                    loaded_weight = loaded_weight[:param.numel()].view(param.shape)
+                else:
+                    padded = torch.zeros(param.shape, dtype=loaded_weight.dtype, device=loaded_weight.device)
+                    padded[:loaded_weight.numel()] = loaded_weight.flatten()
+                    loaded_weight = padded
+
+        elif "channel_scale" in param_name:
+            loaded_weight = ensure_dtype(loaded_weight, param.dtype)
+            if loaded_weight.dim() == 1:
+                loaded_weight = loaded_weight.reshape(1, 1, -1)
+            elif loaded_weight.dim() == 2:
+                if loaded_weight.shape[0] == 1:
+                    loaded_weight = loaded_weight.reshape(1, 1, -1)
+            if loaded_weight.shape != param.shape:
+                logger.warning(f"channel_scale shape mismatch: param {param.shape} vs loaded {loaded_weight.shape}")
+                if loaded_weight.numel() == param.numel():
+                    loaded_weight = loaded_weight.reshape(param.shape)
+                else:
+                    logger.warning(f"Cannot reshape channel_scale, using ones")
+                    loaded_weight = torch.ones_like(param)
+
+        # Final loading
+        try:
+            if param.numel() == 1 and loaded_weight.numel() == 1:
+                param.data.fill_(loaded_weight.item())
+            else:
+                if param.size() != loaded_weight.size():
+                    logger.error(
+                        f"Final size mismatch for {param_name}: param {param.size()} vs loaded {loaded_weight.size()}")
+                    raise AssertionError(
+                        f"Attempted to load weight ({loaded_weight.size()}) into parameter ({param.size()})")
+                param.data.copy_(loaded_weight)
+            logger.info(f"Successfully loaded GBA weight: {param_name}")
+        except Exception as e:
+            logger.error(f"Failed to load GBA weight {param_name}: {e}")
+            raise
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Processing after weight loading - this should be called by the model loader"""
@@ -391,8 +566,8 @@ class GBALinearMethod(LinearMethodBase):
         return strategy
 
     def _get_layer_config(self, layer_prefix: str) -> Dict[str, Any]:
-        """获取层特定的量化配置 - 使用改进的策略匹配"""
-        logger.debug(f"Getting layer config for prefix: {layer_prefix}")
+        """获取层特定的量化配置 - 修复版本"""
+        logger.info(f"Getting layer config for prefix: {layer_prefix}")
 
         if not hasattr(self.quant_config, 'strategy') or not self.quant_config.strategy:
             logger.debug("No strategy config available")
@@ -401,7 +576,14 @@ class GBALinearMethod(LinearMethodBase):
         strategy = self.quant_config.strategy
         logger.debug(f"Available strategy keys: {list(strategy.keys())}")
 
-        # 解析层名称，如 "model.layers.0.self_attn.q_proj"
+        # 如果layer_prefix是类名（如"RowParallelLinear"），无法直接匹配策略
+        # 这种情况下使用默认配置
+        if layer_prefix in ["RowParallelLinear", "ColumnParallelLinear", "QKVParallelLinear",
+                            "MergedColumnParallelLinear", "ReplicatedLinear"]:
+            logger.info(f"Layer prefix is class name: {layer_prefix}, using default config")
+            return {}
+
+        # 解析完整的层路径，如 "model.layers.0.self_attn.q_proj"
         parts = layer_prefix.split('.')
         layer_num = None
         proj_type = None
@@ -424,49 +606,79 @@ class GBALinearMethod(LinearMethodBase):
         # 尝试层特定配置（JSON格式：model.layers.0.q_proj）
         if layer_num is not None and proj_type is not None:
             layer_key = f"model.layers.{layer_num}"
-            logger.debug(f"Looking for layer key: {layer_key}, proj type: {proj_type}")
+            logger.info(f"Looking for layer key: {layer_key}, proj type: {proj_type}")
 
             if layer_key in strategy:
                 layer_config = strategy[layer_key]
                 if proj_type in layer_config:
                     proj_config = layer_config[proj_type]
-                    logger.debug(f"Found layer-specific proj config: {proj_config}")
+                    logger.info(f"Found layer-specific proj config: {proj_config}")
 
                     # 从策略配置中提取参数
                     config = {}
-                    if 'bits' in proj_config and proj_config['bits']:
-                        config['weight_bits'] = proj_config['bits'][0]
-                    if 'group_size' in proj_config:
-                        group_sizes = proj_config['group_size']
-                        if isinstance(group_sizes, dict):
-                            config['group_size'] = list(group_sizes.values())[0]
 
-                    logger.debug(f"Extracted layer-specific config: {config}")
+                    # 提取weight_bits
+                    if 'bits' in proj_config and proj_config['bits']:
+                        if isinstance(proj_config['bits'], list):
+                            config['weight_bits'] = proj_config['bits'][0]
+                        else:
+                            config['weight_bits'] = proj_config['bits']
+
+                    # 提取group_size - 修复访问逻辑
+                    if 'group_size' in proj_config:
+                        group_size_config = proj_config['group_size']
+                        if isinstance(group_size_config, dict):
+                            # 获取第一个可用的group_size值
+                            weight_bits_str = str(config.get('weight_bits', 4))
+                            if weight_bits_str in group_size_config:
+                                config['group_size'] = group_size_config[weight_bits_str]
+                            else:
+                                # 如果没有对应的bits，取第一个值
+                                config['group_size'] = next(iter(group_size_config.values()))
+                        else:
+                            config['group_size'] = group_size_config
+
+                    logger.info(f"Extracted layer-specific config: {config}")
                     return config
+                else:
+                    logger.debug(f"Projection type {proj_type} not found in layer {layer_key}")
+            else:
+                logger.debug(f"Layer key {layer_key} not found in strategy")
 
         # 使用通用策略匹配（apply_quant_strategy函数）
         logger.debug("No layer-specific config found, trying generic strategy matching")
 
         generic_strategy = self.apply_quant_strategy(layer_prefix, strategy)
         if generic_strategy:
-            logger.debug(f"Found generic strategy: {generic_strategy}")
+            logger.info(f"Found generic strategy: {generic_strategy}")
 
             # 转换策略格式到配置格式
             config = {}
-            if 'bits' in generic_strategy and generic_strategy['bits']:
-                config['weight_bits'] = generic_strategy['bits'][0] if isinstance(generic_strategy['bits'], list) else \
-                generic_strategy['bits']
-            if 'group_size' in generic_strategy:
-                group_sizes = generic_strategy['group_size']
-                if isinstance(group_sizes, dict):
-                    config['group_size'] = list(group_sizes.values())[0]
-                else:
-                    config['group_size'] = group_sizes
 
-            logger.debug(f"Extracted generic config: {config}")
+            # 提取weight_bits
+            if 'bits' in generic_strategy and generic_strategy['bits']:
+                if isinstance(generic_strategy['bits'], list):
+                    config['weight_bits'] = generic_strategy['bits'][0]
+                else:
+                    config['weight_bits'] = generic_strategy['bits']
+
+            # 提取group_size - 修复访问逻辑
+            if 'group_size' in generic_strategy:
+                group_size_config = generic_strategy['group_size']
+                if isinstance(group_size_config, dict):
+                    weight_bits_str = str(config.get('weight_bits', 4))
+                    if weight_bits_str in group_size_config:
+                        config['group_size'] = group_size_config[weight_bits_str]
+                    else:
+                        # 如果没有对应的bits，取第一个值
+                        config['group_size'] = next(iter(group_size_config.values()))
+                else:
+                    config['group_size'] = group_size_config
+
+            logger.info(f"Extracted generic config: {config}")
             return config
 
-        logger.debug("No configuration found, using defaults")
+        logger.info("No configuration found, using defaults")
         return {}
 
     def apply(
@@ -502,7 +714,7 @@ class GBALinearMethod(LinearMethodBase):
             layer.zeros,
             layer.q_perm,
             layer.group_size,
-            getattr(layer, 'weight_bits', self.quant_config.weight_bits),
+            layer.weight_bits,
             self.quant_config.use_mbw,
             q_group_map,
             rows_list,
