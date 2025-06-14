@@ -11,12 +11,50 @@ try:
         should_quantize_moe_layer, get_moe_layer_strategy_mapping,
         apply_moe_patches, restore_moe_patches
     )
-except ImportError:
+    GBA_AVAILABLE = True
+except ImportError as e:
     # Fallback if not properly installed
-    logger.warning("GBA quantization modules not found. Please ensure proper installation.")
+    logger.warning(f"GBA quantization modules not found: {e}. Please ensure proper installation.")
     GBAConfig = None
     GBALinearMethod = None
+    GBA_AVAILABLE = False
 
+
+def integrate_gba_with_vllm():
+    """
+    Main integration function to set up GBA quantization in vLLM.
+    This should be called during vLLM initialization.
+    """
+    if not GBA_AVAILABLE:
+        raise ImportError("GBA quantization modules not available. Please ensure proper installation.")
+
+    # Register GBA quantization using vLLM's official mechanism
+    from vllm.model_executor.layers.quantization import register_quantization_config
+    from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
+
+    if "gba" not in QUANTIZATION_METHODS:
+        try:
+            # Method 1: Try official registration
+            @register_quantization_config("gba")
+            class GBAConfigRegistration(GBAConfig):
+                """GBA quantization configuration registered with vLLM"""
+                pass
+
+            logger.info("Registered GBA quantization with vLLM using official registration")
+        except Exception as e:
+            logger.warning(f"Official registration failed: {e}, trying manual registration")
+
+            # Method 2: Manual registration fallback
+            try:
+                QUANTIZATION_METHODS["gba"] = GBAConfig
+                logger.info("Registered GBA quantization with vLLM using manual registration")
+            except Exception as e2:
+                logger.error(f"Both registration methods failed: {e2}")
+                raise e2
+    else:
+        logger.info("GBA quantization already registered")
+
+    logger.info("GBA integration with vLLM completed")
 
 
 class GBAIntegrationManager:
@@ -27,26 +65,15 @@ class GBAIntegrationManager:
 
     def __init__(self):
         self.is_initialized = False
+        self._ensure_gba_available()
+
+    def _ensure_gba_available(self):
+        if not GBA_AVAILABLE:
+            raise ImportError("GBA quantization modules not available. Please ensure proper installation.")
 
     def register_gba_quantization(self):
         """Register GBA quantization with vLLM's quantization system"""
-
-        # Check if GBA is already registered
-        from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
-
-        if "gba" not in QUANTIZATION_METHODS:
-            # Register using vLLM's official registration mechanism
-            from vllm.model_executor.layers.quantization import register_quantization_config
-
-            # This will automatically add "gba" to QUANTIZATION_METHODS
-            @register_quantization_config("gba")
-            class GBAConfigRegistration(GBAConfig):
-                pass
-
-            logger.info("Registered GBA quantization with vLLM using official registration")
-        else:
-            logger.info("GBA quantization already registered")
-
+        integrate_gba_with_vllm()
         self.is_initialized = True
 
     def detect_and_configure_gba(self, model_config) -> Optional['GBAConfig']:
@@ -59,14 +86,14 @@ class GBAIntegrationManager:
         Returns:
             GBA configuration if detected, None otherwise
         """
-        if GBAConfig is None:
+        if not GBA_AVAILABLE:
             logger.warning("GBA quantization modules not available")
             return None
 
         from vllm.model_executor.model_loader.weight_utils import detect_gba_quantization, load_gba_strategy_config
 
         model_path = model_config.model
-        hf_config_dict = model_config.hf_config.to_dict()
+        hf_config_dict = model_config.hf_config.to_dict() if hasattr(model_config, 'hf_config') else {}
 
         # Detect GBA quantization
         is_gba, gba_config_dict = detect_gba_quantization(model_path, hf_config_dict)
@@ -119,52 +146,37 @@ class GBAIntegrationManager:
         return default_weight_loader
 
 
-def integrate_gba_with_vllm():
-    """
-    Main integration function to set up GBA quantization in vLLM.
-    This should be called during vLLM initialization.
-    """
-    if GBAConfig is None:
-        raise ImportError("GBA quantization modules not available. Please ensure proper installation.")
-
-    # Register GBA quantization using vLLM's official mechanism
-    from vllm.model_executor.layers.quantization import register_quantization_config
-    from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
-
-    if "gba" not in QUANTIZATION_METHODS:
-        @register_quantization_config("gba")
-        class GBAConfigRegistration(GBAConfig):
-            """GBA quantization configuration registered with vLLM"""
-            pass
-
-        logger.info("Registered GBA quantization with vLLM")
-    else:
-        logger.info("GBA quantization already registered")
-
-    logger.info("GBA integration with vLLM completed")
-
-
-def patch_vllm_for_gba_support(manager: GBAIntegrationManager):
+def patch_vllm_for_gba_support(manager: Optional[GBAIntegrationManager] = None):
     """
     Apply patches to vLLM functions to support GBA quantization.
 
     Args:
-        manager: The GBA integration manager
+        manager: The GBA integration manager (optional)
     """
+    if manager is None:
+        manager = GBAIntegrationManager()
+        manager.register_gba_quantization()
 
     # Patch the quantization config getter
     try:
         from vllm.model_executor.model_loader.weight_utils import get_quant_config
-        original_get_quant_config = get_quant_config
+
+        # Store original function to avoid infinite recursion
+        if not hasattr(get_quant_config, '_original_function'):
+            get_quant_config._original_function = get_quant_config
 
         def patched_get_quant_config(model_config, load_config):
             # Try GBA detection first
-            gba_config = manager.detect_and_configure_gba(model_config)
-            if gba_config:
-                return gba_config
+            try:
+                gba_config = manager.detect_and_configure_gba(model_config)
+                if gba_config:
+                    logger.info("Using GBA quantization config")
+                    return gba_config
+            except Exception as e:
+                logger.warning(f"GBA detection failed: {e}")
 
             # Fallback to original implementation
-            return original_get_quant_config(model_config, load_config)
+            return get_quant_config._original_function(model_config, load_config)
 
         # Apply the patch
         import vllm.model_executor.model_loader.weight_utils
@@ -175,3 +187,11 @@ def patch_vllm_for_gba_support(manager: GBAIntegrationManager):
     except Exception as e:
         logger.warning(f"Failed to apply some patches: {e}")
         logger.info("GBA will still work but some automatic detection may not function")
+
+
+# Auto-initialize when module is imported
+if GBA_AVAILABLE:
+    try:
+        integrate_gba_with_vllm()
+    except Exception as e:
+        logger.warning(f"Auto-initialization failed: {e}")

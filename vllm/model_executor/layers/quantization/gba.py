@@ -91,6 +91,13 @@ class GBAConfig(QuantizationConfig):
             return GBALinearMethod(self)
         return None
 
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> Optional["GBALinearMethod"]:
+        """return quantization method"""
+        if isinstance(layer, LinearBase):
+            logger.debug(f"Creating GBA linear method for layer: {prefix}")
+            return GBALinearMethod(self)
+        return None
+
     def get_scaled_act_names(self) -> List[str]:
         return []
 
@@ -100,6 +107,9 @@ class GBALinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: GBAConfig):
         self.quant_config = quant_config
+        logger.debug(
+            f"Initialized GBA linear method with config: weight_bits={quant_config.weight_bits}, "
+            f"group_size={quant_config.group_size}")
 
     def create_weights(
             self,
@@ -115,17 +125,25 @@ class GBALinearMethod(LinearMethodBase):
 
         output_size_per_partition = sum(output_partition_sizes)
 
-        # Calculate quantization parameter dimensions
-        group_size = self.quant_config.group_size
+        # layer specific config
+        layer_prefix = extra_weight_attrs.get("prefix", "")
+        layer_config = self._get_layer_config(layer_prefix)
+
+        logger.debug(f"layer config: {layer_config},"
+                     f"layer prefix: {layer_prefix}")
+
+        weight_bits = layer_config.get("weight_bits", self.quant_config.weight_bits)
+        group_size = layer_config.get("group_size", self.quant_config.group_size)
+
         if group_size == -1:
             group_size = input_size_per_partition
 
-        num_groups = (input_size_per_partition + group_size - 1) // group_size
+        num_groups = input_size_per_partition // group_size
 
         # Determine weight shape based on whether mixed bit-width is used
         if not self.quant_config.use_mbw:
             # Standard quantization mode
-            packed_rows = input_size_per_partition * self.quant_config.weight_bits // 32
+            packed_rows = input_size_per_partition * weight_bits // 32
             qweight_shape = (packed_rows, output_size_per_partition)
         else:
             # Mixed bit-width mode - use dynamic packing size
@@ -160,6 +178,13 @@ class GBALinearMethod(LinearMethodBase):
         )
         set_weight_attrs(q_perm, {"input_dim": 0, "output_dim": -1})
 
+        channel_scale = torch.nn.Parameter(
+            torch.ones((1, 1, input_size_per_partition), dtype=params_dtype, device="cuda"),
+            requires_grad=False,
+        )
+        set_weight_attrs(channel_scale, {"input_dim": 2, "output_dim": -1})
+        layer.register_parameter("channel_scale", channel_scale)
+
         # Mixed bit-width mode requires additional parameters
         if self.quant_config.use_mbw:
             # Group information
@@ -176,16 +201,20 @@ class GBALinearMethod(LinearMethodBase):
 
         # Register all parameters
         layer.register_parameter("qweight", qweight)
-        layer.register_parameter("qscales", qscales)
-        layer.register_parameter("qzeros", qzeros)
+        layer.register_parameter("scales", qscales)
+        layer.register_parameter("zeros", qzeros)
         layer.register_parameter("q_perm", q_perm)
 
         # Store configuration
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
         layer.group_size = group_size
+        layer.weight_bits = weight_bits
 
-        layer._gba_weights_initialized = False
+        layer._gba_weights_initialized = True
+        logger.debug(f"Created GBA weights for layer with shapes: "
+                     f"qweight={qweight_shape}, "
+                     f"scales={scale_zero_shape}")
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Processing after weight loading - this should be called by the model loader"""
@@ -200,7 +229,7 @@ class GBALinearMethod(LinearMethodBase):
             return
 
         # Check if necessary weights have been loaded
-        required_weights = ["qweight", "qscales", "qzeros", "q_perm"]
+        required_weights = ["qweight", "scales", "zeros", "q_perm", "channel_scale"]
         for weight_name in required_weights:
             if not hasattr(layer, weight_name):
                 raise ValueError(f"Missing required weight: {weight_name}")
@@ -254,6 +283,192 @@ class GBALinearMethod(LinearMethodBase):
         # Mark as processed
         layer._gba_weights_processed = True
 
+    def apply_quant_strategy(self, name_attr: str, quant_strategy: Dict):
+        """
+        Apply quantization strategy based on the layer's name and the provided strategy.
+        Updated to support DeepSeek V2 MoE models and other complex architectures.
+        """
+        strategy = None
+
+        # DeepSeek V2 style attention projections (decomposed Q/K/V)
+        deepseek_attention_mapping = {
+            'q_a_proj': 'q_a_proj',
+            'q_b_proj': 'q_b_proj',
+            'kv_a_proj_with_mqa': 'kv_a_proj_with_mqa',
+            'kv_b_proj': 'kv_b_proj'
+        }
+
+        for layer_name, strategy_key in deepseek_attention_mapping.items():
+            if layer_name in name_attr:
+                try:
+                    strategy = quant_strategy[strategy_key]
+                    return strategy
+                except KeyError:
+                    pass
+
+        # Standard attention projections (for backward compatibility)
+        standard_attention_keys = ['q_proj', 'k_proj', 'v_proj', 'o_proj']
+        for key in standard_attention_keys:
+            if key in name_attr and not any(prefix in name_attr for prefix in ['q_a_', 'q_b_', 'kv_a_', 'kv_b_']):
+                try:
+                    strategy = quant_strategy[key]
+                    return strategy
+                except KeyError:
+                    pass
+
+        # MoE gate layer (router) - includes both weight and bias
+        # DeepSeek V2 has: mlp.gate.weight and mlp.gate.e_score_correction_bias
+        if ('mlp.gate.' in name_attr or name_attr.endswith('mlp.gate')) and 'experts' not in name_attr:
+            try:
+                strategy = quant_strategy['moe_gate']
+                return strategy
+            except KeyError:
+                pass
+
+        # MoE shared expert layers (DeepSeek V2 specific)
+        # Note: actual path is 'mlp.shared_experts.' (plural)
+        if 'mlp.shared_experts.' in name_attr or 'shared_experts.' in name_attr:
+            if '.gate_proj' in name_attr or 'gate_proj' in name_attr:
+                try:
+                    strategy = quant_strategy['moe_shared_expert_gate_proj']
+                    return strategy
+                except KeyError:
+                    pass
+            elif '.up_proj' in name_attr or 'up_proj' in name_attr:
+                try:
+                    strategy = quant_strategy['moe_shared_expert_up_proj']
+                    return strategy
+                except KeyError:
+                    pass
+            elif '.down_proj' in name_attr or 'down_proj' in name_attr:
+                try:
+                    strategy = quant_strategy['moe_shared_expert_down_proj']
+                    return strategy
+                except KeyError:
+                    pass
+
+        # MoE expert layers - match any expert number (supports 100+ experts)
+        if 'mlp.experts.' in name_attr:
+            if '.gate_proj' in name_attr:
+                try:
+                    strategy = quant_strategy['moe_expert_gate_proj']
+                    return strategy
+                except KeyError:
+                    pass
+            elif '.up_proj' in name_attr:
+                try:
+                    strategy = quant_strategy['moe_expert_up_proj']
+                    return strategy
+                except KeyError:
+                    pass
+            elif '.down_proj' in name_attr:
+                try:
+                    strategy = quant_strategy['moe_expert_down_proj']
+                    return strategy
+                except KeyError:
+                    pass
+
+        # Fallback to standard FFN layers (non-MoE layers)
+        standard_ffn_keys = ['gate_proj', 'up_proj', 'down_proj']
+        for key in standard_ffn_keys:
+            if key in name_attr and 'experts' not in name_attr and 'shared_experts' not in name_attr:
+                try:
+                    strategy = quant_strategy[key]
+                    return strategy
+                except KeyError:
+                    pass
+
+        # Additional fallback for other layer types
+        fallback_keys = ['qkv_proj', 'gate_up_proj']
+        for key in fallback_keys:
+            if key in name_attr:
+                try:
+                    strategy = quant_strategy[key]
+                    return strategy
+                except KeyError:
+                    pass
+
+        return strategy
+
+    def _get_layer_config(self, layer_prefix: str) -> Dict[str, Any]:
+        """获取层特定的量化配置 - 使用改进的策略匹配"""
+        logger.debug(f"Getting layer config for prefix: {layer_prefix}")
+
+        if not hasattr(self.quant_config, 'strategy') or not self.quant_config.strategy:
+            logger.debug("No strategy config available")
+            return {}
+
+        strategy = self.quant_config.strategy
+        logger.debug(f"Available strategy keys: {list(strategy.keys())}")
+
+        # 解析层名称，如 "model.layers.0.self_attn.q_proj"
+        parts = layer_prefix.split('.')
+        layer_num = None
+        proj_type = None
+
+        # 查找层编号
+        for i, part in enumerate(parts):
+            if part == "layers" and i + 1 < len(parts):
+                try:
+                    layer_num = int(parts[i + 1])
+                    break
+                except ValueError:
+                    continue
+
+        # 查找投影类型
+        for part in parts:
+            if part in ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']:
+                proj_type = part
+                break
+
+        # 尝试层特定配置（JSON格式：model.layers.0.q_proj）
+        if layer_num is not None and proj_type is not None:
+            layer_key = f"model.layers.{layer_num}"
+            logger.debug(f"Looking for layer key: {layer_key}, proj type: {proj_type}")
+
+            if layer_key in strategy:
+                layer_config = strategy[layer_key]
+                if proj_type in layer_config:
+                    proj_config = layer_config[proj_type]
+                    logger.debug(f"Found layer-specific proj config: {proj_config}")
+
+                    # 从策略配置中提取参数
+                    config = {}
+                    if 'bits' in proj_config and proj_config['bits']:
+                        config['weight_bits'] = proj_config['bits'][0]
+                    if 'group_size' in proj_config:
+                        group_sizes = proj_config['group_size']
+                        if isinstance(group_sizes, dict):
+                            config['group_size'] = list(group_sizes.values())[0]
+
+                    logger.debug(f"Extracted layer-specific config: {config}")
+                    return config
+
+        # 使用通用策略匹配（apply_quant_strategy函数）
+        logger.debug("No layer-specific config found, trying generic strategy matching")
+
+        generic_strategy = self.apply_quant_strategy(layer_prefix, strategy)
+        if generic_strategy:
+            logger.debug(f"Found generic strategy: {generic_strategy}")
+
+            # 转换策略格式到配置格式
+            config = {}
+            if 'bits' in generic_strategy and generic_strategy['bits']:
+                config['weight_bits'] = generic_strategy['bits'][0] if isinstance(generic_strategy['bits'], list) else \
+                generic_strategy['bits']
+            if 'group_size' in generic_strategy:
+                group_sizes = generic_strategy['group_size']
+                if isinstance(group_sizes, dict):
+                    config['group_size'] = list(group_sizes.values())[0]
+                else:
+                    config['group_size'] = group_sizes
+
+            logger.debug(f"Extracted generic config: {config}")
+            return config
+
+        logger.debug("No configuration found, using defaults")
+        return {}
+
     def apply(
             self,
             layer: torch.nn.Module,
@@ -265,6 +480,10 @@ class GBALinearMethod(LinearMethodBase):
         # Ensure weights are processed
         if not hasattr(layer, '_gba_weights_processed'):
             self.process_weights_after_loading(layer)
+
+        # perform channel_scale
+        if hasattr(layer, 'channel_scale'):
+            x = x.mul(layer.channel_scale)
 
         # Prepare parameters
         q_group_map = getattr(layer, "q_group_map", None)
@@ -279,11 +498,11 @@ class GBALinearMethod(LinearMethodBase):
         output = ops.gba_linear_forward(
             x,
             layer.qweight,
-            layer.qscales,
-            layer.qzeros,
+            layer.scales,
+            layer.zeros,
             layer.q_perm,
             layer.group_size,
-            self.quant_config.weight_bits,
+            getattr(layer, 'weight_bits', self.quant_config.weight_bits),
             self.quant_config.use_mbw,
             q_group_map,
             rows_list,

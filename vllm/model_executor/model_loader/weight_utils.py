@@ -146,6 +146,31 @@ def convert_bin_to_safetensor_file(
 def get_quant_config(model_config: ModelConfig,
                      load_config: LoadConfig) -> QuantizationConfig:
 
+    # 新增：GBA 量化检测和处理
+    if hasattr(model_config, 'quantization') and model_config.quantization == "gba":
+        logger.info("Detected GBA quantization from model config")
+
+        # Try to get GBA config from hf_config
+        hf_config_dict = model_config.hf_config.to_dict() if hasattr(model_config, 'hf_config') else {}
+        is_gba, gba_config_dict = detect_gba_quantization(str(model_config.model), hf_config_dict)
+
+        if is_gba:
+            from vllm.model_executor.layers.quantization.gba import GBAConfig
+            logger.info(f"Creating GBA config: {gba_config_dict}")
+            return GBAConfig.from_config(gba_config_dict)
+
+    # Try automatic GBA detection if not explicitly set
+    if model_config.quantization is None:
+        hf_config_dict = model_config.hf_config.to_dict() if hasattr(model_config, 'hf_config') else {}
+        is_gba, gba_config_dict = detect_gba_quantization(str(model_config.model), hf_config_dict)
+
+        if is_gba:
+            from vllm.model_executor.layers.quantization.gba import GBAConfig
+            logger.info(f"Auto-detected GBA quantization, creating config: {gba_config_dict}")
+            # Update model config to reflect GBA quantization
+            model_config.quantization = "gba"
+            return GBAConfig.from_config(gba_config_dict)
+
     quant_cls = get_quantization_config(model_config.quantization)
 
     # GGUF doesn't have config file
@@ -881,6 +906,29 @@ def gba_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor,
                 padded = torch.zeros(param.shape, dtype=loaded_weight.dtype, device=loaded_weight.device)
                 padded[:loaded_weight.numel()] = loaded_weight.flatten()
                 loaded_weight = padded
+    elif "channel_scale" in param_name:
+        loaded_weight = ensure_dtype(loaded_weight, param.dtype)
+
+        # channel_scale 的期望形状是 (1, 1, input_size)
+        if loaded_weight.dim() == 1:
+            # 如果加载的权重是1D，reshape为 (1, 1, input_size)
+            loaded_weight = loaded_weight.reshape(1, 1, -1)
+        elif loaded_weight.dim() == 2:
+            # 如果是2D，可能需要调整
+            if loaded_weight.shape[0] == 1:
+                loaded_weight = loaded_weight.reshape(1, 1, -1)
+
+        # 确保形状匹配
+        if loaded_weight.shape != param.shape:
+            logger.warning(
+                f"channel_scale shape mismatch: param {param.shape} vs loaded {loaded_weight.shape}, "
+                f"attempting to reshape"
+            )
+            if loaded_weight.numel() == param.numel():
+                loaded_weight = loaded_weight.reshape(param.shape)
+            else:
+                logger.warning(f"Cannot reshape channel_scale, using default values")
+                return default_weight_loader(param, torch.ones_like(param))
 
     # Fallback to default loading mechanism
     return default_weight_loader(param, loaded_weight)
@@ -922,6 +970,7 @@ def load_gba_strategy_config(model_path: str) -> Optional[Dict[str, Any]]:
 
     return None
 
+
 def detect_gba_quantization(model_path: str, config: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     """Detect if the model uses GBA quantization and extract configuration."""
 
@@ -932,20 +981,64 @@ def detect_gba_quantization(model_path: str, config: Dict[str, Any]) -> Tuple[bo
                    "layer-mix" in model_name or
                    "channel-mix" in model_name)
 
-    # Check for strategy files if it's a local path
-    has_strategy_files = False
-    if os.path.isdir(model_path):
-        strategy_config = load_gba_strategy_config(model_path)
-        has_strategy_files = strategy_config is not None
+    def get_model_path(path_or_hf_repo: str, token=None) -> Path:
+        """
+        Ensures the model is available locally. If the path does not exist locally,
+        it is downloaded from the Hugging Face Hub.
+        """
+        model_path = Path(path_or_hf_repo)
+        if not model_path.exists():
+            model_path = Path(
+                snapshot_download(
+                    repo_id=path_or_hf_repo,
+                    allow_patterns=[
+                        "*.json",
+                        "*.safetensors",
+                        "*.py",
+                        "tokenizer.model",
+                        "*.tiktoken",
+                        "*.txt",
+                    ],
+                    token=token
+                )
+            )
+        return model_path
 
-    is_gba_model = is_gba_name or has_strategy_files
+    # 使用改进的路径获取逻辑
+    has_strategy_files = False
+    strategy_config = None
+    try:
+        local_model_path = get_model_path(model_path)
+        if local_model_path.exists():
+            strategy_config = load_gba_strategy_config(str(local_model_path))
+            if strategy_config:
+                has_strategy_files = True
+                logger.info(f"Loaded strategy config from {local_model_path}")
+                logger.debug(f"Strategy config: {strategy_config}")
+    except Exception as e:
+        logger.warning(f"Failed to get local model path for {model_path}: {e}")
+
+    # Check for quantization_config in hf config
+    has_quant_config = "quantization_config" in config
+    if has_quant_config:
+        quant_config = config["quantization_config"]
+        is_gba_config = (
+                isinstance(quant_config, dict) and
+                quant_config.get("quantization_method") == "gba"
+        )
+    else:
+        is_gba_config = False
+
+    is_gba_model = is_gba_name or has_strategy_files or is_gba_config
 
     if is_gba_model:
         gba_config = {
             "quantization_method": "gba",
+            "quant_method": "gba",
             "weight_bits": 4,
             "group_size": 128,
-            "use_mbw": "layer-mix" in model_name or "channel-mix" in model_name
+            "use_mbw": "channel-mix" in model_name,
+            "_name_or_path": model_name
         }
 
         # Parse bit width and group size from model name
@@ -957,9 +1050,15 @@ def detect_gba_quantization(model_path: str, config: Dict[str, Any]) -> Tuple[bo
         if groupsize_match:
             gba_config["group_size"] = int(groupsize_match.group(1))
 
+        # Use existing quantization_config if available
+        if has_quant_config and is_gba_config:
+            quant_config = config["quantization_config"]
+            gba_config.update(quant_config)
+
         # Add strategy config if available
-        if os.path.isdir(model_path) and strategy_config:
+        if strategy_config:
             gba_config["strategy"] = strategy_config
+            logger.info("Successfully added strategy config to GBA config")
 
         # Add MoE info
         from vllm.model_executor.layers.quantization.gba_moe_support import detect_moe_model_type
@@ -972,6 +1071,8 @@ def detect_gba_quantization(model_path: str, config: Dict[str, Any]) -> Tuple[bo
         moe_info = detect_moe_model_type(mock_config)
         gba_config["moe_info"] = moe_info
 
+        logger.info(
+            f"Detected GBA quantization for {model_name}: bits={gba_config['weight_bits']}, group_size={gba_config['group_size']}, use_mbw={gba_config['use_mbw']}")
         return True, gba_config
 
     return False, {}
@@ -987,8 +1088,8 @@ def should_use_gba_weight_loader(param_name: str) -> bool:
         True if should use GBA weight loader
     """
     gba_param_indicators = [
-        "qweight", "qscales", "qzeros", "q_perm", "q_groups",
-        "scales", "zeros"  # Alternative naming
+        "qweight", "scales", "zeros", "q_perm", "q_groups",
+        "qscales", "qzeros", "channel_scale"  # Alternative naming
     ]
 
     return any(indicator in param_name for indicator in gba_param_indicators)
