@@ -55,6 +55,8 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 
 
 class Qwen2MLP(nn.Module):
@@ -374,13 +376,25 @@ class Qwen2Model(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
+
+        # 获取当前模型的 packed_modules_mapping
+        model_packed_mapping = getattr(self, 'packed_modules_mapping', {})
+
+        # 如果 packed_modules_mapping 为空，说明使用分离层，不进行参数映射
+        use_stacked_mapping = bool(model_packed_mapping)
+
+        if not use_stacked_mapping:
+            logger.info("检测到分离层架构，禁用参数名映射")
+
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: set[str] = set()
+
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+
             if (self.quant_config is not None and
-                (scale_name := self.quant_config.get_cache_scale(name))):
+                    (scale_name := self.quant_config.get_cache_scale(name))):
                 # Loading kv cache quantization scales
                 param = params_dict[scale_name]
                 weight_loader = getattr(param, "weight_loader",
@@ -390,35 +404,70 @@ class Qwen2Model(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(scale_name)
                 continue
-            for (param_name, weight_name, shard_id) in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
+
+            # 尝试参数映射（仅当使用融合层时）
+            mapped = False
+            if use_stacked_mapping:
+                for (param_name, weight_name, shard_id) in stacked_params_mapping:
+                    if weight_name not in name:
+                        continue
+                    mapped_name = name.replace(weight_name, param_name)
+                    # Skip loading extra bias for GPTQ models.
+                    if mapped_name.endswith(".bias") and mapped_name not in params_dict:
+                        continue
+                    if is_pp_missing_parameter(mapped_name, self):
+                        continue
+                    if mapped_name in params_dict:
+                        param = params_dict[mapped_name]
+                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        weight_loader(param, loaded_weight, shard_id)
+                        loaded_params.add(mapped_name)
+                        mapped = True
+                        break
+
+            if not mapped:
+                # 直接加载，不进行映射
+                original_name = name
+
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                # weight_loader = param.weight_loader
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
+
                 # Remapping the name of FP8 kv-scale.
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:
                     continue
+
                 if is_pp_missing_parameter(name, self):
                     continue
+
+                # 检查参数是否存在
+                if name not in params_dict:
+                    # 如果参数不存在，尝试一些变通方法
+                    logger.warning(
+                        f"Parameter {name} not found in model. Available parameters starting with similar pattern:")
+
+                    # 查找类似的参数名
+                    similar_params = []
+                    name_parts = name.split('.')
+                    if len(name_parts) >= 2:
+                        search_pattern = '.'.join(name_parts[:-1])  # 去掉最后一部分
+                        for param_name in params_dict.keys():
+                            if search_pattern in param_name:
+                                similar_params.append(param_name)
+
+                    if similar_params:
+                        logger.warning(f"Similar parameters found: {similar_params[:5]}...")  # 只显示前5个
+
+                    # 跳过这个权重
+                    logger.warning(f"Skipping weight: {original_name}")
+                    continue
+
                 param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+                loaded_params.add(name)
+
         return loaded_params
 
 

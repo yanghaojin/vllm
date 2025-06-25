@@ -609,10 +609,10 @@ def enhance_config_with_quantization(config, model_path: str):
         # 重新创建配置对象
         try:
             enhanced_config = config.__class__.from_dict(config_dict)
-            logger.info(
-                f"Enhanced config with GBA quantization: "
-                f"bits={gba_config.get('weight_bits', 4)}, "
-                f"group_size={gba_config.get('group_size', 128)}")
+            # logger.info(
+            #     f"Enhanced config with GBA quantization: "
+            #     f"bits={gba_config.get('weight_bits', 4)}, "
+            #     f"group_size={gba_config.get('group_size', 128)}")
             return enhanced_config
         except Exception as e:
             logger.warning(f"Failed to create enhanced config: {e}, using original config")
