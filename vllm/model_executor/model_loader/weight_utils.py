@@ -832,13 +832,13 @@ def load_gba_strategy_config(model_path: str) -> Optional[Dict[str, Any]]:
 
                 # Handle different config formats
                 if "measurement" in config:
-                    logger.info(f"Loaded GBA strategy config from {strategy_path}")
+                    # logger.info(f"Loaded GBA strategy config from {strategy_path}")
                     return config["measurement"]
                 elif "strategy" in config:
-                    logger.info(f"Loaded GBA strategy config from {strategy_path}")
+                    # logger.info(f"Loaded GBA strategy config from {strategy_path}")
                     return config["strategy"]
                 else:
-                    logger.info(f"Loaded GBA config from {strategy_path}")
+                    # logger.info(f"Loaded GBA config from {strategy_path}")
                     return config
 
             except (json.JSONDecodeError, IOError) as e:
@@ -949,7 +949,7 @@ def detect_gba_quantization(model_path: str, config: Dict[str, Any]) -> Tuple[bo
         gba_config["moe_info"] = moe_info
 
         logger.info(
-            f"Detected GBA quantization for {model_name}: bits={gba_config['weight_bits']}, group_size={gba_config['group_size']}, use_mbw={gba_config['use_mbw']}")
+            f"Detected GBA quantization for {model_name}: bits={gba_config['weight_bits']}, use_mbw={gba_config['use_mbw']}")
         return True, gba_config
 
     return False, {}

@@ -5,11 +5,6 @@
 # Copyright 2023 The vLLM team.
 # Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 #
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
-#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -34,8 +29,11 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (QKVParallelLinear,
+from vllm.model_executor.layers.linear import (ColumnParallelLinear,
+                                               MergedColumnParallelLinear,
+                                               QKVParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -45,11 +43,100 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsLoRA, SupportsPP
-from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen2 import Qwen2Model
 from .utils import AutoWeightsLoader, PPMissingLayer, maybe_prefix
 
 logger = init_logger(__name__)
+
+
+class Qwen3MLP(nn.Module):
+    """Qwen3 MLP with fused gate_up_proj"""
+
+    def __init__(
+            self,
+            hidden_size: int,
+            intermediate_size: int,
+            hidden_act: str,
+            quant_config: Optional[QuantizationConfig] = None,
+            prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
+        )
+        if hidden_act != "silu":
+            raise ValueError(f"Unsupported activation: {hidden_act}. "
+                             "Only silu is supported for now.")
+        self.act_fn = SiluAndMul()
+
+    def forward(self, x):
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
+
+class Qwen3MLPSeparated(nn.Module):
+    """Qwen3 MLP with separated gate_proj and up_proj for non-fused weights"""
+
+    def __init__(
+            self,
+            hidden_size: int,
+            intermediate_size: int,
+            hidden_act: str,
+            quant_config: Optional[QuantizationConfig] = None,
+            prefix: str = "",
+    ) -> None:
+        super().__init__()
+
+        # 创建分离的投影层
+        self.gate_proj = ColumnParallelLinear(
+            hidden_size,
+            intermediate_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_proj",
+        )
+        self.up_proj = ColumnParallelLinear(
+            hidden_size,
+            intermediate_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.up_proj",
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
+        )
+        if hidden_act != "silu":
+            raise ValueError(f"Unsupported activation: {hidden_act}. "
+                             "Only silu is supported for now.")
+
+    def forward(self, x):
+        # 分离的前向传播
+        gate_output, _ = self.gate_proj(x)
+        up_output, _ = self.up_proj(x)
+
+        # 手动实现 SiLU 激活和元素乘法
+        gate_output = torch.nn.functional.silu(gate_output)
+        intermediate = gate_output * up_output
+
+        x, _ = self.down_proj(intermediate)
+        return x
 
 
 class Qwen3Attention(nn.Module):
@@ -67,7 +154,8 @@ class Qwen3Attention(nn.Module):
                  quant_config: Optional[QuantizationConfig] = None,
                  rope_scaling: Optional[tuple] = None,
                  prefix: str = "",
-                 attn_type: str = AttentionType.DECODER) -> None:
+                 attn_type: str = AttentionType.DECODER,
+                 use_fused_qkv: bool = True) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
@@ -87,18 +175,47 @@ class Qwen3Attention(nn.Module):
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
+        self.scaling = self.head_dim ** -0.5
         self.rope_theta = rope_theta
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=qkv_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
-        )
+        self.use_fused_qkv = use_fused_qkv
+
+        # 根据是否使用融合QKV决定创建哪种投影层
+        if self.use_fused_qkv:
+            # 创建融合的QKV投影
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=qkv_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
+        else:
+            # 创建分离的Q/K/V投影
+            self.q_proj = ColumnParallelLinear(
+                hidden_size,
+                self.total_num_heads * self.head_dim,
+                bias=qkv_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.q_proj",
+            )
+            self.k_proj = ColumnParallelLinear(
+                hidden_size,
+                self.total_num_kv_heads * self.head_dim,
+                bias=qkv_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.k_proj",
+            )
+            self.v_proj = ColumnParallelLinear(
+                hidden_size,
+                self.total_num_kv_heads * self.head_dim,
+                bias=qkv_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.v_proj",
+            )
+
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -126,12 +243,20 @@ class Qwen3Attention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
     def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+            self,
+            positions: torch.Tensor,
+            hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.use_fused_qkv:
+            # 融合QKV前向传播
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        else:
+            # 分离QKV前向传播
+            q, _ = self.q_proj(hidden_states)
+            k, _ = self.k_proj(hidden_states)
+            v, _ = self.v_proj(hidden_states)
+
         # Add qk-norm
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim,
                            self.head_dim)
@@ -150,11 +275,13 @@ class Qwen3Attention(nn.Module):
 class Qwen3DecoderLayer(nn.Module):
 
     def __init__(
-        self,
-        config: Qwen3Config,
-        cache_config: Optional[CacheConfig] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
+            self,
+            config: Qwen3Config,
+            cache_config: Optional[CacheConfig] = None,
+            quant_config: Optional[QuantizationConfig] = None,
+            prefix: str = "",
+            use_fused_qkv: bool = True,
+            use_fused_gate_up: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -185,24 +312,38 @@ class Qwen3DecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
+            use_fused_qkv=use_fused_qkv,
         )
-        self.mlp = Qwen3MLP(
-            hidden_size=self.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-            quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
-        )
+
+        # 根据是否使用融合MLP决定创建哪种MLP
+        if use_fused_gate_up:
+            self.mlp = Qwen3MLP(
+                hidden_size=self.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp",
+            )
+        else:
+            # 使用分离版本的MLP
+            self.mlp = Qwen3MLPSeparated(
+                hidden_size=self.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp",
+            )
+
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
 
     def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+            self,
+            positions: torch.Tensor,
+            hidden_states: torch.Tensor,
+            residual: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
@@ -240,23 +381,79 @@ ALL_DECODER_LAYER_TYPES = {
 class Qwen3Model(Qwen2Model):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        # 在创建层之前，检测权重格式
+        use_fused_qkv, use_fused_gate_up = self._detect_weight_format(vllm_config.model_config.model)
+
+        # 创建带有正确融合配置的decoder layer类型
+        def create_decoder_layer(config, cache_config, quant_config, prefix):
+            return Qwen3DecoderLayer(
+                config=config,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=prefix,
+                use_fused_qkv=use_fused_qkv,
+                use_fused_gate_up=use_fused_gate_up,
+            )
+
         super().__init__(vllm_config=vllm_config,
                          prefix=prefix,
-                         decoder_layer_type=Qwen3DecoderLayer)
+                         decoder_layer_type=create_decoder_layer)
+
+    def _detect_weight_format(self, model_path: str) -> tuple[bool, bool]:
+        """检测权重格式并返回是否使用融合层"""
+        try:
+            from safetensors import safe_open
+            from huggingface_hub import snapshot_download
+            import os
+
+            # 下载权重文件
+            local_path = snapshot_download(model_path, allow_patterns="*.safetensors")
+
+            # 检查权重文件中的键
+            weight_keys = set()
+            for root, dirs, files in os.walk(local_path):
+                for file in files:
+                    if file.endswith('.safetensors'):
+                        safetensors_file = os.path.join(root, file)
+                        try:
+                            with safe_open(safetensors_file, framework="pt") as f:
+                                weight_keys.update(f.keys())
+                        except Exception as e:
+                            logger.warning(f"Failed to read {file}: {e}")
+
+            # 检测权重格式
+            has_fused_qkv = any("qkv_proj.qweight" in key for key in weight_keys)
+            has_separated_qkv = (any("q_proj.qweight" in key for key in weight_keys) and
+                                 any("k_proj.qweight" in key for key in weight_keys) and
+                                 any("v_proj.qweight" in key for key in weight_keys))
+
+            has_fused_gate_up = any("gate_up_proj.qweight" in key for key in weight_keys)
+            has_separated_gate_up = (any("gate_proj.qweight" in key for key in weight_keys) and
+                                     any("up_proj.qweight" in key for key in weight_keys))
+
+            logger.info(f"权重格式检测结果:")
+            logger.info(f"  融合QKV: {has_fused_qkv}, 分离QKV: {has_separated_qkv}")
+            logger.info(f"  融合Gate-Up: {has_fused_gate_up}, 分离Gate-Up: {has_separated_gate_up}")
+
+            # 决定使用哪种格式
+            use_fused_qkv = has_fused_qkv and not has_separated_qkv
+            use_fused_gate_up = has_fused_gate_up and not has_separated_gate_up
+
+            logger.info(f"最终决定:")
+            logger.info(f"  使用融合QKV: {use_fused_qkv}")
+            logger.info(f"  使用融合Gate-Up: {use_fused_gate_up}")
+
+            return use_fused_qkv, use_fused_gate_up
+
+        except Exception as e:
+            logger.error(f"权重格式检测失败: {e}")
+            logger.info("使用默认配置：分离层架构")
+            return False, False  # 默认使用分离层
 
 
 class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
-    packed_modules_mapping = {
-        "qkv_proj": [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-        ],
-        "gate_up_proj": [
-            "gate_proj",
-            "up_proj",
-        ],
-    }
+    # 根据检测结果动态设置 packed_modules_mapping
+    packed_modules_mapping = {}
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -266,8 +463,11 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
         self.config = config
         self.lora_config = lora_config
-
         self.quant_config = quant_config
+
+        # 检测权重格式并设置 packed_modules_mapping - 必须在创建模型之前
+        self._detect_and_set_packed_mapping(vllm_config.model_config.model)
+
         self.model = Qwen3Model(vllm_config=vllm_config,
                                 prefix=maybe_prefix(prefix, "model"))
 
@@ -288,24 +488,80 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
 
+    def _detect_and_set_packed_mapping(self, model_path: str):
+        """检测权重格式并设置packed_modules_mapping"""
+        try:
+            from safetensors import safe_open
+            from huggingface_hub import snapshot_download
+            import os
+
+            # 下载权重文件
+            local_path = snapshot_download(model_path, allow_patterns="*.safetensors")
+
+            # 检查权重文件中的键
+            weight_keys = set()
+            for root, dirs, files in os.walk(local_path):
+                for file in files:
+                    if file.endswith('.safetensors'):
+                        safetensors_file = os.path.join(root, file)
+                        try:
+                            with safe_open(safetensors_file, framework="pt") as f:
+                                weight_keys.update(f.keys())
+                        except Exception as e:
+                            logger.warning(f"Failed to read {file}: {e}")
+
+            # 检测权重格式
+            has_fused_qkv = any("qkv_proj.qweight" in key for key in weight_keys)
+            has_separated_qkv = (any("q_proj.qweight" in key for key in weight_keys) and
+                                 any("k_proj.qweight" in key for key in weight_keys) and
+                                 any("v_proj.qweight" in key for key in weight_keys))
+
+            has_fused_gate_up = any("gate_up_proj.qweight" in key for key in weight_keys)
+            has_separated_gate_up = (any("gate_proj.qweight" in key for key in weight_keys) and
+                                     any("up_proj.qweight" in key for key in weight_keys))
+
+            # 根据检测结果设置 packed_modules_mapping
+            new_mapping = {}
+
+            if has_fused_qkv and not has_separated_qkv:
+                new_mapping["qkv_proj"] = ["q_proj", "k_proj", "v_proj"]
+                logger.info("设置融合QKV映射")
+            elif has_separated_qkv:
+                logger.info("检测到分离QKV，不使用融合映射")
+
+            if has_fused_gate_up and not has_separated_gate_up:
+                new_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
+                logger.info("设置融合Gate-Up映射")
+            elif has_separated_gate_up:
+                logger.info("检测到分离Gate-Up，不使用融合映射")
+
+            # 更新类的packed_modules_mapping
+            self.__class__.packed_modules_mapping = new_mapping
+            logger.info(f"最终packed_modules_mapping: {new_mapping}")
+
+        except Exception as e:
+            logger.error(f"权重格式检测失败: {e}")
+            logger.info("使用空的packed_modules_mapping（分离层）")
+            self.__class__.packed_modules_mapping = {}
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
 
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
+            self,
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            intermediate_tensors: Optional[IntermediateTensors] = None,
+            inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         hidden_states = self.model(input_ids, positions, intermediate_tensors,
                                    inputs_embeds)
         return hidden_states
 
     def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
+            self,
+            hidden_states: torch.Tensor,
+            sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
         logits = self.logits_processor(self.lm_head, hidden_states,
                                        sampling_metadata)
