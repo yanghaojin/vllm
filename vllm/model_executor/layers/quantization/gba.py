@@ -1,5 +1,5 @@
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union, Callable
 import torch
 
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
@@ -7,9 +7,100 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.logger import init_logger
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.quantization.gba_moe_support import apply_moe_patches, apply_moe_quant_strategy
+from vllm.model_executor.layers.fused_moe.layer import FusedMoEMethodBase, UnquantizedFusedMoEMethod
 
 logger = init_logger(__name__)
 
+
+class GBAFusedMoEMethod(FusedMoEMethodBase):
+    """GBA quantization method for FusedMoE layers - simplified version"""
+
+    def __init__(self, quant_config):
+        super().__init__()
+        self.quant_config = quant_config
+        self._fallback_method = None
+
+    def create_weights(
+            self,
+            layer: torch.nn.Module,
+            num_experts: int,
+            hidden_size: int,
+            intermediate_size_per_partition: int,
+            params_dtype: torch.dtype,
+            **extra_weight_attrs,
+    ):
+        """Create weights for MoE experts - using fallback method for now"""
+
+        logger.info(f"Creating GBA MoE weights (fallback): experts={num_experts}, "
+                    f"hidden={hidden_size}, intermediate={intermediate_size_per_partition}")
+
+        # 直接创建标准的未量化权重
+        # 这确保了与权重文件的兼容性
+
+        # Fused gate_up_proj (column parallel)
+        w13_weight = torch.nn.Parameter(torch.empty(
+            num_experts,
+            2 * intermediate_size_per_partition,
+            hidden_size,
+            dtype=params_dtype),
+            requires_grad=False)
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        # down_proj (row parallel)
+        w2_weight = torch.nn.Parameter(torch.empty(
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
+            dtype=params_dtype),
+            requires_grad=False)
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        logger.info("Created standard MoE weights (no quantization for now)")
+
+    def apply(
+            self,
+            layer: torch.nn.Module,
+            x: torch.Tensor,
+            router_logits: torch.Tensor,
+            top_k: int,
+            renormalize: bool,
+            use_grouped_topk: bool = False,
+            topk_group: Optional[int] = None,
+            num_expert_group: Optional[int] = None,
+            global_num_experts: int = -1,
+            expert_map: Optional[torch.Tensor] = None,
+            custom_routing_function: Optional[Callable] = None,
+            scoring_func: str = "softmax",
+            e_score_correction_bias: Optional[torch.Tensor] = None,
+            apply_router_weight_on_input: bool = False,
+            activation: str = "silu",
+    ) -> torch.Tensor:
+        """Apply MoE forward pass - using fallback for now"""
+
+        if self._fallback_method is None:
+            raise RuntimeError("Fallback method not initialized")
+
+        # 委托给未量化方法处理
+        return self._fallback_method.apply(
+            layer=layer,
+            x=x,
+            router_logits=router_logits,
+            top_k=top_k,
+            renormalize=renormalize,
+            use_grouped_topk=use_grouped_topk,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            activation=activation,
+        )
 
 class GBAConfig(QuantizationConfig):
     """GBA quantization configuration class"""
@@ -80,17 +171,57 @@ class GBAConfig(QuantizationConfig):
             strategy=strategy,
         )
 
-        # Add MoE info if present
+        # Add MoE info if present and apply patches
         if 'moe_info' in config:
             instance.moe_info = config['moe_info']
 
+            logger.info(f"MoE info detected: {instance.moe_info}")
+
+            # Apply MoE patches if needed
+            from vllm.model_executor.layers.quantization.gba_moe_support import apply_moe_patches
+            try:
+                applied_patches = apply_moe_patches(instance.moe_info)
+                instance.applied_moe_patches = applied_patches
+                if applied_patches:
+                    logger.info(f"Applied MoE patches: {applied_patches}")
+            except Exception as e:
+                logger.warning(f"Failed to apply MoE patches: {e}")
+                instance.applied_moe_patches = []
+
         return instance
 
-    def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> Optional["GBALinearMethod"]:
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> Optional[Union["GBALinearMethod", "GBAFusedMoEMethod"]]:
         """return quantization method"""
+        # 处理FusedMoE层 - 优先级最高
+        try:
+            from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+            if isinstance(layer, FusedMoE):
+                logger.debug(f"Creating GBA FusedMoE method for layer: {prefix}")
+                return GBAFusedMoEMethod(self)
+        except ImportError:
+            pass
+
+        # 处理普通Linear层
         if isinstance(layer, LinearBase):
             logger.debug(f"Creating GBA linear method for layer: {prefix}")
             return GBALinearMethod(self)
+
+        # 处理MoE专家层的模式匹配（作为后备）
+        if 'experts' in prefix and any(proj in prefix for proj in ['gate_proj', 'up_proj', 'down_proj']):
+            logger.debug(f"Creating GBA linear method for MoE expert layer: {prefix}")
+            return GBALinearMethod(self)
+
+        # 处理MoE门控层
+        if 'gate' in prefix and 'experts' not in prefix:
+            logger.debug(f"Creating GBA linear method for MoE gate layer: {prefix}")
+            return GBALinearMethod(self)
+
+        # 处理包含'mlp'的层（可能是MoE相关）
+        if 'mlp' in prefix.lower():
+            logger.debug(f"Creating GBA linear method for MLP layer: {prefix}")
+            return GBALinearMethod(self)
+
+        logger.debug(f"No quantization method for layer: {prefix} (type: {type(layer).__name__})")
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -152,19 +283,30 @@ class GBALinearMethod(LinearMethodBase):
             params_dtype: torch.dtype,
             **extra_weight_attrs,
     ) -> None:
-        """Create GBA quantized weight parameters - 简化版本，支持分离层"""
+        """Create GBA quantized weight parameters"""
 
         output_size_per_partition = sum(output_partition_sizes)
 
-        # 获取 GBA 权重加载器
         gba_weight_loader = self._get_gba_weight_loader()
 
         # layer specific config
         layer_prefix = extra_weight_attrs.get("prefix", "")
 
-        logger.info(f"Creating GBA weights for layer: {layer_prefix}")
-        logger.info(f"  input_size_per_partition: {input_size_per_partition}")
-        logger.info(f"  output_size_per_partition: {output_size_per_partition}")
+        logger.debug(f"Creating GBA weights for layer: {layer_prefix}")
+        logger.debug(f"  input_size_per_partition: {input_size_per_partition}")
+        logger.debug(f"  output_size_per_partition: {output_size_per_partition}")
+
+        is_moe_expert = 'experts' in layer_prefix and any(
+            proj in layer_prefix for proj in ['gate_proj', 'up_proj', 'down_proj'])
+        is_moe_gate = 'gate' in layer_prefix and 'experts' not in layer_prefix
+
+        if is_moe_expert:
+            logger.debug(f"Detected MoE expert layer: {layer_prefix}")
+            # 对于MoE专家层，暂时跳过GBA量化
+            logger.warning(f"Skipping GBA quantization for MoE expert layer: {layer_prefix}")
+            return
+        elif is_moe_gate:
+            logger.debug(f"Detected MoE gate layer: {layer_prefix}")
 
         layer_config = self._get_layer_config(layer_prefix)
 
@@ -176,7 +318,6 @@ class GBALinearMethod(LinearMethodBase):
 
         num_groups = input_size_per_partition // group_size
 
-        # 简化的权重形状计算 - 不再处理融合层的复杂情况
         if not self.quant_config.use_mbw:
             # Standard quantization mode
             packed_rows = input_size_per_partition * weight_bits // 32
@@ -188,9 +329,9 @@ class GBALinearMethod(LinearMethodBase):
         # Create quantization scales and zero points
         scale_zero_shape = (num_groups, output_size_per_partition)
 
-        logger.info(f"Creating parameter shapes:")
-        logger.info(f"  qweight: {qweight_shape}")
-        logger.info(f"  scales/zeros: {scale_zero_shape}")
+        logger.debug(f"Creating parameter shapes:")
+        logger.debug(f"  qweight: {qweight_shape}")
+        logger.debug(f"  scales/zeros: {scale_zero_shape}")
 
         # Create quantized weights
         qweight = torch.nn.Parameter(
@@ -238,17 +379,19 @@ class GBALinearMethod(LinearMethodBase):
             "weight_loader": gba_weight_loader
         })
 
-        channel_scale = torch.nn.Parameter(
-            torch.ones((1, 1, input_size_per_partition), dtype=params_dtype, device="cuda"),
-            requires_grad=False,
-        )
-        channel_scale._param_name = "channel_scale"
-        set_weight_attrs(channel_scale, {
-            "input_dim": 2,
-            "output_dim": -1,
-            "weight_loader": gba_weight_loader
-        })
-        layer.register_parameter("channel_scale", channel_scale)
+        # **修改：只为非MoE层创建channel_scale**
+        if not is_moe_expert and not is_moe_gate:
+            channel_scale = torch.nn.Parameter(
+                torch.ones((1, 1, input_size_per_partition), dtype=params_dtype, device="cuda"),
+                requires_grad=False,
+            )
+            channel_scale._param_name = "channel_scale"
+            set_weight_attrs(channel_scale, {
+                "input_dim": 2,
+                "output_dim": -1,
+                "weight_loader": gba_weight_loader
+            })
+            layer.register_parameter("channel_scale", channel_scale)
 
         # Mixed bit-width mode requires additional parameters
         if self.quant_config.use_mbw:
@@ -281,16 +424,16 @@ class GBALinearMethod(LinearMethodBase):
         layer.group_size = group_size
         layer.weight_bits = weight_bits
 
+        layer.is_moe_expert = is_moe_expert
+        layer.is_moe_gate = is_moe_gate
+
         layer._gba_weights_initialized = True
-        logger.info(f"Successfully created GBA weights for {layer_prefix}")
+        logger.debug(f"Successfully created GBA weights for {layer_prefix}")
 
     def _get_gba_weight_loader(self):
-        """Get GBA-specific weight loader function - 简化版本"""
+        """Get GBA-specific weight loader function """
 
         def gba_weight_loader_wrapper(param: torch.nn.Parameter, loaded_weight: torch.Tensor, *args, **kwargs):
-            """GBA权重加载器包装函数 - 简化版本"""
-
-            # 推断参数名
             param_name = self._infer_param_name(param, args[0] if args else None)
 
             logger.debug(f"GBA weight loader: {param_name} - param: {param.shape}, loaded: {loaded_weight.shape}")
@@ -300,38 +443,34 @@ class GBALinearMethod(LinearMethodBase):
         return gba_weight_loader_wrapper
 
     def _infer_param_name(self, param: torch.nn.Parameter, shard_id=None) -> str:
-        """参数名推断逻辑 - 简化版本"""
 
-        # 方法1：直接从参数属性获取
         if hasattr(param, '_param_name'):
             return param._param_name
 
-        # 方法2：根据参数特征推断
         param_shape = param.shape
         param_dtype = param.dtype
         param_dim = param.dim()
 
-        # 量化权重 (int32, 2D)
+        # (int32, 2D)
         if param_dtype == torch.int32 and param_dim == 2:
             return "qweight"
 
-        # 排列索引 (int16, 1D)
+        # (int16, 1D)
         elif param_dtype == torch.int16:
             if param_dim == 1:
                 return "q_perm"
             else:
                 return "q_groups"
 
-        # 通道缩放因子 (float, 3D, 第一两维为1)
+        # (float, 3D)
         elif param_dim == 3 and param_shape[0] == 1 and param_shape[1] == 1:
             return "channel_scale"
 
-        # scales和zeros (float, 2D) - 使用简单的顺序判断
+        # scales和zeros (float, 2D)
         elif param_dtype in [torch.float16, torch.bfloat16, torch.float32] and param_dim == 2:
             if not hasattr(self, '_scale_zero_counter'):
                 self._scale_zero_counter = 0
 
-            # 简单的交替逻辑：第一个是scales，第二个是zeros
             if self._scale_zero_counter % 2 == 0:
                 self._scale_zero_counter += 1
                 return "scales"
@@ -339,11 +478,10 @@ class GBALinearMethod(LinearMethodBase):
                 self._scale_zero_counter += 1
                 return "zeros"
 
-        # 兜底策略
         return f"unknown_{param_dim}d_{param_dtype}"
 
     def _gba_weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor, param_name: str) -> None:
-        """GBA quantized weight loader implementation - 简化版本"""
+        """GBA quantized weight loader implementation"""
 
         logger.debug(f"Loading GBA weight: {param_name}")
         logger.debug(f"  Param shape: {param.shape}, Loaded shape: {loaded_weight.shape}")
@@ -354,16 +492,13 @@ class GBALinearMethod(LinearMethodBase):
             return tensor
 
         def ensure_shape(tensor: torch.Tensor, target_shape: torch.Size, param_name: str) -> torch.Tensor:
-            """确保张量具有正确的形状 - 简化版本"""
             if tensor.shape == target_shape:
                 return tensor
 
-            # 如果元素数量相同，直接reshape
             if tensor.numel() == target_shape.numel():
                 logger.debug(f"Reshaping {param_name}: {tensor.shape} -> {target_shape}")
                 return tensor.view(target_shape)
 
-            # 形状不匹配且元素数量不同 - 报错
             raise ValueError(
                 f"Shape mismatch for {param_name}:\n"
                 f"  Expected: {target_shape} ({target_shape.numel()} elements)\n"
@@ -371,11 +506,9 @@ class GBALinearMethod(LinearMethodBase):
                 f"  This indicates a mismatch between model architecture and weight file."
             )
 
-        # 应用修复
         loaded_weight = ensure_dtype(loaded_weight, param.dtype)
         shaped_weight = ensure_shape(loaded_weight, param.shape, param_name)
 
-        # 数值安全检查
         if 'scale' in param_name.lower():
             if torch.all(shaped_weight == 0):
                 logger.warning(f"Warning: {param_name} is all zeros! Fixing...")
@@ -388,7 +521,6 @@ class GBALinearMethod(LinearMethodBase):
                                             torch.ones_like(shaped_weight) * 1e-6,
                                             shaped_weight)
 
-        # 复制数据
         param.data.copy_(shaped_weight)
 
         logger.debug(f"Successfully loaded {param_name}")
@@ -461,19 +593,58 @@ class GBALinearMethod(LinearMethodBase):
         layer._gba_weights_processed = True
 
     def _get_layer_config(self, layer_prefix: str) -> Dict[str, Any]:
-        """获取层特定的量化配置 - 简化版本"""
 
         if not hasattr(self.quant_config, 'strategy') or not self.quant_config.strategy:
             return {}
 
         strategy = self.quant_config.strategy
 
-        # 解析完整的层路径
+        # 检查是否是MoE层
+        moe_info = getattr(self.quant_config, 'moe_info', {'type': 'standard'})
+
+        # 使用增强的MoE策略应用
+        from vllm.model_executor.layers.quantization.gba_moe_support import apply_moe_quant_strategy
+
+        layer_strategy = apply_moe_quant_strategy(layer_prefix, strategy, moe_info)
+
+        if layer_strategy:
+            config = {}
+
+            # 提取weight_bits
+            if 'bits' in layer_strategy and layer_strategy['bits']:
+                if isinstance(layer_strategy['bits'], list):
+                    config['weight_bits'] = layer_strategy['bits'][0]
+                else:
+                    config['weight_bits'] = layer_strategy['bits']
+
+            # 提取group_size
+            if 'group_size' in layer_strategy:
+                group_size_config = layer_strategy['group_size']
+                if isinstance(group_size_config, dict):
+                    weight_bits_str = str(config.get('weight_bits', 4))
+                    if weight_bits_str in group_size_config:
+                        config['group_size'] = group_size_config[weight_bits_str]
+                    else:
+                        config['group_size'] = next(iter(group_size_config.values()))
+                else:
+                    config['group_size'] = group_size_config
+
+            return config
+
+        # 回退到原有逻辑
+        return self._get_layer_config_fallback(layer_prefix)
+
+    def _get_layer_config_fallback(self, layer_prefix: str) -> Dict[str, Any]:
+
+        if not hasattr(self.quant_config, 'strategy') or not self.quant_config.strategy:
+            return {}
+
+        strategy = self.quant_config.strategy
+
         parts = layer_prefix.split('.')
         layer_num = None
         proj_type = None
 
-        # 查找层编号
         for i, part in enumerate(parts):
             if part == "layers" and i + 1 < len(parts):
                 try:
@@ -482,7 +653,6 @@ class GBALinearMethod(LinearMethodBase):
                 except ValueError:
                     continue
 
-        # 查找投影类型
         for part in parts:
             if part in ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']:
                 proj_type = part
@@ -497,17 +667,14 @@ class GBALinearMethod(LinearMethodBase):
                 if proj_type in layer_config:
                     proj_config = layer_config[proj_type]
 
-                    # 从策略配置中提取参数
                     config = {}
 
-                    # 提取weight_bits
                     if 'bits' in proj_config and proj_config['bits']:
                         if isinstance(proj_config['bits'], list):
                             config['weight_bits'] = proj_config['bits'][0]
                         else:
                             config['weight_bits'] = proj_config['bits']
 
-                    # 提取group_size
                     if 'group_size' in proj_config:
                         group_size_config = proj_config['group_size']
                         if isinstance(group_size_config, dict):
@@ -515,7 +682,6 @@ class GBALinearMethod(LinearMethodBase):
                             if weight_bits_str in group_size_config:
                                 config['group_size'] = group_size_config[weight_bits_str]
                             else:
-                                # 如果没有对应的bits，取第一个值
                                 config['group_size'] = next(iter(group_size_config.values()))
                         else:
                             config['group_size'] = group_size_config
@@ -536,14 +702,12 @@ class GBALinearMethod(LinearMethodBase):
         if not hasattr(layer, '_gba_weights_processed'):
             self.process_weights_after_loading(layer)
 
-        # 记录原始信息
         original_dtype = x.dtype
         original_shape = x.shape
 
-        # 处理输入形状和 channel_scale 应用
         if x.dim() == 3:
-            # 输入是 3D [batch, seq_len, hidden_size]
-            # 应用 channel_scale（原始方式）
+            # 3D input [batch, seq_len, hidden_size]
+            # Apply channel_scale (original method)
             if hasattr(layer, 'channel_scale'):
                 channel_scale = layer.channel_scale
                 if channel_scale.dtype != torch.float16:
@@ -554,8 +718,8 @@ class GBALinearMethod(LinearMethodBase):
             x, shape = flatten_x(x)
 
         elif x.dim() == 2:
-            # 输入是 2D [batch*seq_len, hidden_size]
-            # 修改 channel_scale 的形状以适应 2D 输入
+            # 2D input [batch*seq_len, hidden_size]
+            # Modify the shape of channel_scale to accommodate 2D input
             if hasattr(layer, 'channel_scale'):
                 channel_scale = layer.channel_scale  # 原始形状 [1, 1, hidden_size]
                 if channel_scale.dtype != torch.float16:
@@ -571,13 +735,13 @@ class GBALinearMethod(LinearMethodBase):
 
                 x = x.mul(channel_scale_2d)  # Broadcasting: [batch*seq_len, hidden_size] * [hidden_size]
 
-            # 对于 2D 输入，设置假的 shape 用于后续处理
+            # For 2D input, set a fake shape for subsequent processing
             shape = [x.size(0)]
 
         else:
             raise ValueError(f"Unsupported input dimension: {x.dim()}, shape: {x.shape}")
 
-        # 确保数据类型
+        # Ensure data type
         if x.dtype != torch.float16:
             x = x.to(torch.float16)
 
@@ -586,11 +750,11 @@ class GBALinearMethod(LinearMethodBase):
         rows_info = getattr(layer, "rows_info", None)
         rows_list = rows_info.tolist() if rows_info is not None and rows_info.numel() > 0 else []
 
-        # 确保权重参数类型正确
+        # Make sure the weight parameter type is correct
         scales = layer.scales.to(torch.float16) if layer.scales.dtype != torch.float16 else layer.scales
         zeros = layer.zeros.to(torch.float16) if layer.zeros.dtype != torch.float16 else layer.zeros
 
-        # 验证形状匹配
+        # Verify shape matches
         expected_input_features = layer.qweight.size(0) * (32 // layer.weight_bits)
         actual_input_features = x.size(1)
 
@@ -618,15 +782,15 @@ class GBALinearMethod(LinearMethodBase):
                 bias = bias.to(output.dtype)
             output = output + bias
 
-        # 恢复输出形状
+        # Restore output shape
         if len(original_shape) == 3:
-            # 原始输入是 3D，恢复为 3D
+            # Original input is 3D, restore to 3D
             output = unflatten_x(output, shape)
         elif len(original_shape) == 2:
-            # 原始输入是 2D，保持 2D
+            # Original input is 2D, keep it 2D
             pass
 
-        # 转换回原始数据类型
+        # Convert back to original data type
         if original_dtype != torch.float16:
             output = output.to(original_dtype)
 

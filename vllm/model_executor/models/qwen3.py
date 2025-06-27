@@ -381,10 +381,10 @@ ALL_DECODER_LAYER_TYPES = {
 class Qwen3Model(Qwen2Model):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        # 在创建层之前，检测权重格式
-        use_fused_qkv, use_fused_gate_up = self._detect_weight_format(vllm_config.model_config.model)
+        # Before creating the layer, check the weight format
+        use_fused_qkv, use_fused_gate_up = self._detect_and_configure_weight_format(vllm_config.model_config.model)
 
-        # 创建带有正确融合配置的decoder layer类型
+        # Create a decoder layer type with the correct fusion configuration
         def create_decoder_layer(config, cache_config, quant_config, prefix):
             return Qwen3DecoderLayer(
                 config=config,
@@ -399,17 +399,16 @@ class Qwen3Model(Qwen2Model):
                          prefix=prefix,
                          decoder_layer_type=create_decoder_layer)
 
-    def _detect_weight_format(self, model_path: str) -> tuple[bool, bool]:
-        """检测权重格式并返回是否使用融合层"""
+    def _detect_and_configure_weight_format(self, model_path: str) -> tuple[bool, bool]:
+        """Detect weight format and configure packed_modules_mapping"""
         try:
             from safetensors import safe_open
             from huggingface_hub import snapshot_download
             import os
 
-            # 下载权重文件
             local_path = snapshot_download(model_path, allow_patterns="*.safetensors")
 
-            # 检查权重文件中的键
+            # Check the keys in the weights file
             weight_keys = set()
             for root, dirs, files in os.walk(local_path):
                 for file in files:
@@ -421,7 +420,6 @@ class Qwen3Model(Qwen2Model):
                         except Exception as e:
                             logger.warning(f"Failed to read {file}: {e}")
 
-            # 检测权重格式
             has_fused_qkv = any("qkv_proj.qweight" in key for key in weight_keys)
             has_separated_qkv = (any("q_proj.qweight" in key for key in weight_keys) and
                                  any("k_proj.qweight" in key for key in weight_keys) and
@@ -431,28 +429,30 @@ class Qwen3Model(Qwen2Model):
             has_separated_gate_up = (any("gate_proj.qweight" in key for key in weight_keys) and
                                      any("up_proj.qweight" in key for key in weight_keys))
 
-            logger.info(f"权重格式检测结果:")
-            logger.info(f"  融合QKV: {has_fused_qkv}, 分离QKV: {has_separated_qkv}")
-            logger.info(f"  融合Gate-Up: {has_fused_gate_up}, 分离Gate-Up: {has_separated_gate_up}")
-
-            # 决定使用哪种格式
             use_fused_qkv = has_fused_qkv and not has_separated_qkv
             use_fused_gate_up = has_fused_gate_up and not has_separated_gate_up
 
-            logger.info(f"最终决定:")
-            logger.info(f"  使用融合QKV: {use_fused_qkv}")
-            logger.info(f"  使用融合Gate-Up: {use_fused_gate_up}")
+            # Setting packed_modules_mapping
+            new_mapping = {}
+            if use_fused_qkv:
+                new_mapping["qkv_proj"] = ["q_proj", "k_proj", "v_proj"]
+            if use_fused_gate_up:
+                new_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
+
+            self.__class__.packed_modules_mapping = new_mapping
+
+            logger.debug(
+                f"Weight format: fused_qkv={use_fused_qkv}, fused_gate_up={use_fused_gate_up}, mapping={new_mapping}")
 
             return use_fused_qkv, use_fused_gate_up
 
         except Exception as e:
             logger.error(f"权重格式检测失败: {e}")
-            logger.info("使用默认配置：分离层架构")
-            return False, False  # 默认使用分离层
-
+            self.__class__.packed_modules_mapping = {}
+            return False, False
 
 class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
-    # 根据检测结果动态设置 packed_modules_mapping
+
     packed_modules_mapping = {}
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -464,9 +464,6 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self.config = config
         self.lora_config = lora_config
         self.quant_config = quant_config
-
-        # 检测权重格式并设置 packed_modules_mapping - 必须在创建模型之前
-        self._detect_and_set_packed_mapping(vllm_config.model_config.model)
 
         self.model = Qwen3Model(vllm_config=vllm_config,
                                 prefix=maybe_prefix(prefix, "model"))
@@ -487,62 +484,6 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
-
-    def _detect_and_set_packed_mapping(self, model_path: str):
-        """检测权重格式并设置packed_modules_mapping"""
-        try:
-            from safetensors import safe_open
-            from huggingface_hub import snapshot_download
-            import os
-
-            # 下载权重文件
-            local_path = snapshot_download(model_path, allow_patterns="*.safetensors")
-
-            # 检查权重文件中的键
-            weight_keys = set()
-            for root, dirs, files in os.walk(local_path):
-                for file in files:
-                    if file.endswith('.safetensors'):
-                        safetensors_file = os.path.join(root, file)
-                        try:
-                            with safe_open(safetensors_file, framework="pt") as f:
-                                weight_keys.update(f.keys())
-                        except Exception as e:
-                            logger.warning(f"Failed to read {file}: {e}")
-
-            # 检测权重格式
-            has_fused_qkv = any("qkv_proj.qweight" in key for key in weight_keys)
-            has_separated_qkv = (any("q_proj.qweight" in key for key in weight_keys) and
-                                 any("k_proj.qweight" in key for key in weight_keys) and
-                                 any("v_proj.qweight" in key for key in weight_keys))
-
-            has_fused_gate_up = any("gate_up_proj.qweight" in key for key in weight_keys)
-            has_separated_gate_up = (any("gate_proj.qweight" in key for key in weight_keys) and
-                                     any("up_proj.qweight" in key for key in weight_keys))
-
-            # 根据检测结果设置 packed_modules_mapping
-            new_mapping = {}
-
-            if has_fused_qkv and not has_separated_qkv:
-                new_mapping["qkv_proj"] = ["q_proj", "k_proj", "v_proj"]
-                logger.info("设置融合QKV映射")
-            elif has_separated_qkv:
-                logger.info("检测到分离QKV，不使用融合映射")
-
-            if has_fused_gate_up and not has_separated_gate_up:
-                new_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
-                logger.info("设置融合Gate-Up映射")
-            elif has_separated_gate_up:
-                logger.info("检测到分离Gate-Up，不使用融合映射")
-
-            # 更新类的packed_modules_mapping
-            self.__class__.packed_modules_mapping = new_mapping
-            logger.info(f"最终packed_modules_mapping: {new_mapping}")
-
-        except Exception as e:
-            logger.error(f"权重格式检测失败: {e}")
-            logger.info("使用空的packed_modules_mapping（分离层）")
-            self.__class__.packed_modules_mapping = {}
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
