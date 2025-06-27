@@ -192,6 +192,12 @@ class GBAConfig(QuantizationConfig):
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> Optional[Union["GBALinearMethod", "GBAFusedMoEMethod"]]:
         """return quantization method"""
+
+        # 处理普通Linear层
+        if isinstance(layer, LinearBase):
+            logger.debug(f"Creating GBA linear method for layer: {prefix}")
+            return GBALinearMethod(self)
+
         # 处理FusedMoE层 - 优先级最高
         try:
             from vllm.model_executor.layers.fused_moe.layer import FusedMoE
@@ -200,11 +206,6 @@ class GBAConfig(QuantizationConfig):
                 return GBAFusedMoEMethod(self)
         except ImportError:
             pass
-
-        # 处理普通Linear层
-        if isinstance(layer, LinearBase):
-            logger.debug(f"Creating GBA linear method for layer: {prefix}")
-            return GBALinearMethod(self)
 
         # 处理MoE专家层的模式匹配（作为后备）
         if 'experts' in prefix and any(proj in prefix for proj in ['gate_proj', 'up_proj', 'down_proj']):
@@ -296,9 +297,10 @@ class GBALinearMethod(LinearMethodBase):
         logger.debug(f"  input_size_per_partition: {input_size_per_partition}")
         logger.debug(f"  output_size_per_partition: {output_size_per_partition}")
 
-        is_moe_expert = 'experts' in layer_prefix and any(
+        is_moe_expert = 'mlp.experts.' in layer_prefix and any(
             proj in layer_prefix for proj in ['gate_proj', 'up_proj', 'down_proj'])
-        is_moe_gate = 'gate' in layer_prefix and 'experts' not in layer_prefix
+        is_moe_gate = (layer_prefix.endswith('mlp.gate') or
+                       'mlp.gate.' in layer_prefix) and 'experts' not in layer_prefix
 
         if is_moe_expert:
             logger.debug(f"Detected MoE expert layer: {layer_prefix}")
@@ -379,8 +381,8 @@ class GBALinearMethod(LinearMethodBase):
             "weight_loader": gba_weight_loader
         })
 
-        # **修改：只为非MoE层创建channel_scale**
         if not is_moe_expert and not is_moe_gate:
+            logger.debug(f"Creating channel_scale for regular layer: {layer_prefix}")
             channel_scale = torch.nn.Parameter(
                 torch.ones((1, 1, input_size_per_partition), dtype=params_dtype, device="cuda"),
                 requires_grad=False,
@@ -392,6 +394,8 @@ class GBALinearMethod(LinearMethodBase):
                 "weight_loader": gba_weight_loader
             })
             layer.register_parameter("channel_scale", channel_scale)
+        else:
+            logger.debug(f"Skipping channel_scale creation for MoE layer: {layer_prefix}")
 
         # Mixed bit-width mode requires additional parameters
         if self.quant_config.use_mbw:
@@ -708,7 +712,7 @@ class GBALinearMethod(LinearMethodBase):
         if x.dim() == 3:
             # 3D input [batch, seq_len, hidden_size]
             # Apply channel_scale (original method)
-            if hasattr(layer, 'channel_scale'):
+            if hasattr(layer, 'channel_scale') and layer.channel_scale is not None:
                 channel_scale = layer.channel_scale
                 if channel_scale.dtype != torch.float16:
                     channel_scale = channel_scale.to(torch.float16)
@@ -720,7 +724,7 @@ class GBALinearMethod(LinearMethodBase):
         elif x.dim() == 2:
             # 2D input [batch*seq_len, hidden_size]
             # Modify the shape of channel_scale to accommodate 2D input
-            if hasattr(layer, 'channel_scale'):
+            if hasattr(layer, 'channel_scale') and layer.channel_scale is not None:
                 channel_scale = layer.channel_scale  # 原始形状 [1, 1, hidden_size]
                 if channel_scale.dtype != torch.float16:
                     channel_scale = channel_scale.to(torch.float16)
