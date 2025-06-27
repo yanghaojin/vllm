@@ -5,11 +5,6 @@
 # Copyright 2023 The vLLM team.
 # Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 #
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
-#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -110,6 +105,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 f"Tensor parallel size {self.tp_size} is greater than "
                 f"the number of experts {config.num_experts}.")
 
+        # 调试信息
+        logger.debug(f"Creating Qwen3MoeSparseMoeBlock with prefix: {prefix}")
+        logger.debug(f"quant_config type: {type(quant_config).__name__ if quant_config else None}")
+        logger.debug(f"num_experts: {config.num_experts}")
+
+        # 直接使用 FusedMoE，让它内部处理量化方法
         self.experts = FusedMoE(num_experts=config.num_experts,
                                 top_k=config.num_experts_per_tok,
                                 hidden_size=config.hidden_size,
@@ -119,10 +120,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                                 quant_config=quant_config,
                                 prefix=f"{prefix}.experts")
 
+        # Gate层的量化处理
         self.gate = ReplicatedLinear(config.hidden_size,
                                      config.num_experts,
                                      bias=False,
-                                     quant_config=None,
+                                     quant_config=quant_config,
                                      prefix=f"{prefix}.gate")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -396,6 +398,10 @@ class Qwen3MoeModel(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+
+        # 跟踪跳过的参数
+        skipped_params: set[str] = set()
+
         for name, loaded_weight in weights:
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
@@ -459,18 +465,49 @@ class Qwen3MoeModel(nn.Module):
                             ".kv_scale", ".attn.kv_scale")
                         if remapped_kv_scale_name not in params_dict:
                             logger.warning_once(
-                                "Found kv scale in the checkpoint (e.g. %s), but not found the expected name in the model (e.g. %s). kv-scale is not loaded.",  # noqa: E501
+                                "Found kv scale in the checkpoint (e.g. %s), but not found the expected name in the model (e.g. %s). kv-scale is not loaded.",
+                                # noqa: E501
                                 name,
                                 remapped_kv_scale_name,
                             )
                             continue
                         else:
                             name = remapped_kv_scale_name
+
+                    # **新增：处理GBA量化相关的参数**
+                    # 检查参数是否存在，如果不存在则跳过
+                    if name not in params_dict:
+                        # 检查是否是GBA量化相关的参数
+                        gba_related_suffixes = [
+                            'channel_scale', 'qweight', 'scales', 'zeros', 'q_perm',
+                            'q_groups', 'q_group_map', 'rows_info'
+                        ]
+
+                        is_gba_related = any(suffix in name for suffix in gba_related_suffixes)
+
+                        if is_gba_related:
+                            logger.warning(f"Skipping GBA quantization parameter not found in checkpoint: {name}")
+                            skipped_params.add(name)
+                            continue
+                        else:
+                            # 对于非GBA相关的参数，记录警告并跳过
+                            logger.warning(f"Parameter not found in model: {name}")
+                            skipped_params.add(name)
+                            continue
+
                     param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        # 报告跳过的参数
+        if skipped_params:
+            logger.info(f"Skipped {len(skipped_params)} parameters during weight loading")
+            if logger.isEnabledFor(logging.DEBUG):
+                for param in sorted(skipped_params):
+                    logger.debug(f"Skipped parameter: {param}")
+
         return loaded_params
 
 

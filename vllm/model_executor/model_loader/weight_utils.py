@@ -49,6 +49,8 @@ except ImportError:
         "SafeTensorsFileLoader")
     SingleGroup = fastsafetensors.placeholder_attr("SingleGroup")
 
+from vllm.model_executor.layers.quantization.gba_moe_support import detect_moe_model_type
+
 logger = init_logger(__name__)
 
 # use system-level temp directory for file locks, so that multiple users
@@ -146,7 +148,6 @@ def convert_bin_to_safetensor_file(
 def get_quant_config(model_config: ModelConfig,
                      load_config: LoadConfig) -> QuantizationConfig:
 
-    # 新增：GBA 量化检测和处理
     if hasattr(model_config, 'quantization') and model_config.quantization == "gba":
         logger.info("Detected GBA quantization from model config")
 
@@ -156,9 +157,6 @@ def get_quant_config(model_config: ModelConfig,
 
         if is_gba:
             from vllm.model_executor.layers.quantization.gba import GBAConfig
-
-            # logger.info(f"Creating GBA config: {gba_config_dict}")
-
             return GBAConfig.from_config(gba_config_dict)
 
     # Try automatic GBA detection if not explicitly set
@@ -168,7 +166,6 @@ def get_quant_config(model_config: ModelConfig,
 
         if is_gba:
             from vllm.model_executor.layers.quantization.gba import GBAConfig
-            logger.info(f"Auto-detected GBA quantization, creating config: {gba_config_dict}")
             # Update model config to reflect GBA quantization
             model_config.quantization = "gba"
             return GBAConfig.from_config(gba_config_dict)
@@ -832,13 +829,10 @@ def load_gba_strategy_config(model_path: str) -> Optional[Dict[str, Any]]:
 
                 # Handle different config formats
                 if "measurement" in config:
-                    # logger.info(f"Loaded GBA strategy config from {strategy_path}")
                     return config["measurement"]
                 elif "strategy" in config:
-                    # logger.info(f"Loaded GBA strategy config from {strategy_path}")
                     return config["strategy"]
                 else:
-                    # logger.info(f"Loaded GBA config from {strategy_path}")
                     return config
 
             except (json.JSONDecodeError, IOError) as e:
@@ -891,7 +885,6 @@ def detect_gba_quantization(model_path: str, config: Dict[str, Any]) -> Tuple[bo
             if strategy_config:
                 has_strategy_files = True
                 logger.info(f"Loaded strategy config from {local_model_path}")
-                logger.debug(f"Strategy config: {strategy_config}")
     except Exception as e:
         logger.warning(f"Failed to get local model path for {model_path}: {e}")
 
@@ -938,7 +931,6 @@ def detect_gba_quantization(model_path: str, config: Dict[str, Any]) -> Tuple[bo
             logger.info("Successfully added strategy config to GBA config")
 
         # Add MoE info
-        from vllm.model_executor.layers.quantization.gba_moe_support import detect_moe_model_type
         class MockConfig:
             def __init__(self, **kwargs):
                 for k, v in kwargs.items():
@@ -949,7 +941,8 @@ def detect_gba_quantization(model_path: str, config: Dict[str, Any]) -> Tuple[bo
         gba_config["moe_info"] = moe_info
 
         logger.info(
-            f"Detected GBA quantization for {model_name}: bits={gba_config['weight_bits']}, use_mbw={gba_config['use_mbw']}")
+            f"Detected GBA quantization for {model_name}: bits={gba_config['weight_bits']}, "
+            f"use_mbw={gba_config['use_mbw']}, moe_type={moe_info['type']}")
         return True, gba_config
 
     return False, {}

@@ -14,7 +14,7 @@ logger = init_logger(__name__)
 def detect_moe_model_type(config) -> Dict[str, Any]:
     """
     Detect MoE model type and return model information
-    Enhanced version from green-bit-llm
+    Enhanced version for vLLM compatibility
     """
     model_info = {
         'type': 'standard',
@@ -22,10 +22,11 @@ def detect_moe_model_type(config) -> Dict[str, Any]:
         'experts_count': 0,
         'has_shared_experts': False,
         'routed_experts': 0,
-        'shared_experts': 0
+        'shared_experts': 0,
+        'use_vllm_fused_moe': True  # vLLM使用FusedMoE
     }
 
-    # Check Qwen3 MoE
+    # Check Qwen3 MoE - vLLM compatible
     if hasattr(config, 'model_type') and 'qwen3' in config.model_type.lower():
         if getattr(config, 'num_experts', 0) > 0:
             model_info.update({
@@ -34,10 +35,11 @@ def detect_moe_model_type(config) -> Dict[str, Any]:
                 'experts_count': config.num_experts,
                 'routed_experts': config.num_experts,
                 'has_shared_experts': getattr(config, 'num_shared_experts', 0) > 0,
-                'shared_experts': getattr(config, 'num_shared_experts', 0)
+                'shared_experts': getattr(config, 'num_shared_experts', 0),
+                'decoder_sparse_step': getattr(config, 'decoder_sparse_step', 1)
             })
 
-    # Check DeepSeek V3 MoE
+    # Check DeepSeek V3 MoE - vLLM compatible
     elif hasattr(config, 'model_type') and 'deepseek' in config.model_type.lower():
         # DeepSeek V3 has different attribute names
         routed_experts = getattr(config, 'n_routed_experts', 0)
@@ -53,11 +55,11 @@ def detect_moe_model_type(config) -> Dict[str, Any]:
                 'shared_experts': shared_experts
             })
 
-    # Check other MoE models (Mixtral, etc.)
+    # Check other MoE models (Mixtral, etc.) - vLLM compatible
     elif hasattr(config, 'num_local_experts') and config.num_local_experts > 0:
         model_info.update({
             'type': 'mixtral_moe',
-            'needs_patch': False,  # Usually don't need patches
+            'needs_patch': False,  # vLLM handles Mixtral natively
             'experts_count': config.num_local_experts,
             'routed_experts': config.num_local_experts,
             'has_shared_experts': False,
@@ -70,7 +72,7 @@ def detect_moe_model_type(config) -> Dict[str, Any]:
 def get_disable_bias_for_moe(name_attr: str, model_type: str, moe_info: Dict[str, Any]) -> bool:
     """
     Enhanced bias handling for MoE models
-    Based on green-bit-llm implementation
+    Compatible with vLLM's FusedMoE architecture
     """
     # Original Qwen2 exception handling
     MODEL_TYPE_QWEN2 = "qwen2"
@@ -86,6 +88,10 @@ def get_disable_bias_for_moe(name_attr: str, model_type: str, moe_info: Dict[str
                 # For DeepSeek models, these layers typically don't use bias
                 return True
 
+    # vLLM FusedMoE expert layers
+    if 'experts.' in name_attr and any(proj in name_attr for proj in ['gate_proj', 'up_proj', 'down_proj']):
+        return True
+
     # Default behavior
     return True
 
@@ -93,7 +99,7 @@ def get_disable_bias_for_moe(name_attr: str, model_type: str, moe_info: Dict[str
 def apply_moe_quant_strategy(name_attr: str, quant_strategy: Dict, moe_info: Dict[str, Any]) -> Optional[Dict]:
     """
     Apply quantization strategy for MoE models
-    Enhanced version from green-bit-llm with MoE-specific handling
+    Enhanced version for vLLM with FusedMoE support
     """
     strategy = None
 
@@ -123,8 +129,8 @@ def apply_moe_quant_strategy(name_attr: str, quant_strategy: Dict, moe_info: Dic
             except KeyError:
                 pass
 
-    # MoE gate layer (router) - includes both weight and bias
-    # DeepSeek V2/V3 has: mlp.gate.weight and mlp.gate.e_score_correction_bias
+    # vLLM FusedMoE gate layer handling
+    # Pattern: mlp.gate.weight (vLLM uses ReplicatedLinear for gates)
     if ('mlp.gate.' in name_attr or name_attr.endswith('mlp.gate')) and 'experts' not in name_attr:
         try:
             strategy = quant_strategy['moe_gate']
@@ -137,47 +143,73 @@ def apply_moe_quant_strategy(name_attr: str, quant_strategy: Dict, moe_info: Dic
                 return None
             pass
 
-    # MoE shared expert layers (DeepSeek V2/V3 specific)
+    # vLLM FusedMoE shared expert layers (DeepSeek V2/V3 specific)
     if 'mlp.shared_experts.' in name_attr or 'shared_experts.' in name_attr:
         if '.gate_proj' in name_attr or 'gate_proj' in name_attr:
             try:
                 strategy = quant_strategy['moe_shared_expert_gate_proj']
                 return strategy
             except KeyError:
-                pass
+                # Fallback to standard gate_proj
+                try:
+                    strategy = quant_strategy['gate_proj']
+                    return strategy
+                except KeyError:
+                    pass
         elif '.up_proj' in name_attr or 'up_proj' in name_attr:
             try:
                 strategy = quant_strategy['moe_shared_expert_up_proj']
                 return strategy
             except KeyError:
-                pass
+                try:
+                    strategy = quant_strategy['up_proj']
+                    return strategy
+                except KeyError:
+                    pass
         elif '.down_proj' in name_attr or 'down_proj' in name_attr:
             try:
                 strategy = quant_strategy['moe_shared_expert_down_proj']
                 return strategy
             except KeyError:
-                pass
+                try:
+                    strategy = quant_strategy['down_proj']
+                    return strategy
+                except KeyError:
+                    pass
 
-    # MoE expert layers - match any expert number (supports 100+ experts)
-    if 'mlp.experts.' in name_attr:
+    # vLLM FusedMoE expert layers - pattern: experts.X.gate_proj, experts.X.up_proj, experts.X.down_proj
+    if 'experts.' in name_attr:
         if '.gate_proj' in name_attr:
             try:
                 strategy = quant_strategy['moe_expert_gate_proj']
                 return strategy
             except KeyError:
-                pass
+                # Fallback to standard gate_proj
+                try:
+                    strategy = quant_strategy['gate_proj']
+                    return strategy
+                except KeyError:
+                    pass
         elif '.up_proj' in name_attr:
             try:
                 strategy = quant_strategy['moe_expert_up_proj']
                 return strategy
             except KeyError:
-                pass
+                try:
+                    strategy = quant_strategy['up_proj']
+                    return strategy
+                except KeyError:
+                    pass
         elif '.down_proj' in name_attr:
             try:
                 strategy = quant_strategy['moe_expert_down_proj']
                 return strategy
             except KeyError:
-                pass
+                try:
+                    strategy = quant_strategy['down_proj']
+                    return strategy
+                except KeyError:
+                    pass
 
     # Fallback to standard FFN layers (non-MoE layers)
     standard_ffn_keys = ['gate_proj', 'up_proj', 'down_proj']
@@ -200,6 +232,149 @@ def apply_moe_quant_strategy(name_attr: str, quant_strategy: Dict, moe_info: Dic
                 pass
 
     return strategy
+
+
+def should_quantize_moe_layer(layer_name: str, layer_module, moe_info: Dict[str, Any]) -> bool:
+    """
+    Determine if a MoE layer should be quantized
+    Enhanced for vLLM compatibility
+    """
+
+    # Only quantize Linear layers
+    if not isinstance(layer_module, nn.Linear):
+        return False
+
+    # Skip embedding and normalization layers
+    skip_patterns = [
+        "embed_tokens", "embed_positions", "layernorm", "norm", "lm_head"
+    ]
+
+    layer_name_lower = layer_name.lower()
+    if any(pattern in layer_name_lower for pattern in skip_patterns):
+        return False
+
+    # For vLLM MoE models, be more selective
+    if moe_info['type'] != 'standard':
+        # Skip very small layers
+        if hasattr(layer_module, 'in_features') and hasattr(layer_module, 'out_features'):
+            if layer_module.in_features < 32 or layer_module.out_features < 32:
+                return False
+
+        # For models with many experts, might want to skip some layers based on strategy
+        if moe_info['experts_count'] > 50:  # Large expert count like DeepSeek V3
+            # Could implement more selective quantization here based on strategy
+            pass
+
+    return True
+
+
+def apply_moe_patches(moe_info: Dict[str, Any]) -> List[str]:
+    """
+    Apply patches for MoE models based on type.
+    Enhanced for vLLM compatibility
+    """
+    applied_patches = []
+
+    if not moe_info['needs_patch']:
+        return applied_patches
+
+    try:
+        if moe_info['type'] == 'qwen3_moe':
+            from vllm.model_executor.layers.quantization.patches.qwen3_moe_patch import apply_qwen3_moe_patch
+
+            # Choose strategy based on expert count and vLLM FusedMoE
+            strategy = 'adaptive'  # Adaptive works well with vLLM FusedMoE
+
+            if apply_qwen3_moe_patch(strategy):
+                applied_patches.append('qwen3_moe')
+                logger.info(f"Applied Qwen3 MoE patch with {strategy} strategy for vLLM")
+
+        elif moe_info['type'] == 'deepseek_v3_moe':
+            from vllm.model_executor.layers.quantization.patches.deepseek_v3_moe_patch import \
+                apply_deepseek_v3_moe_patch
+
+            # Use hybrid strategy for DeepSeek V3 due to large number of experts
+            strategy = 'hybrid' if moe_info['experts_count'] > 50 else 'conservative'
+
+            if apply_deepseek_v3_moe_patch(strategy):
+                applied_patches.append('deepseek_v3_moe')
+                logger.info(f"Applied DeepSeek V3 MoE patch with {strategy} strategy for vLLM")
+
+    except Exception as e:
+        logger.warning(f"Failed to apply MoE patches: {e}")
+        restore_moe_patches(applied_patches)
+        applied_patches = []
+
+    return applied_patches
+
+
+def restore_moe_patches(applied_patches: List[str]):
+    """Restore/cleanup applied MoE patches."""
+    for patch_name in applied_patches:
+        try:
+            if patch_name == 'qwen3_moe':
+                from vllm.model_executor.layers.quantization.patches.qwen3_moe_patch import restore_qwen3_moe_patch
+                restore_qwen3_moe_patch()
+            elif patch_name == 'deepseek_v3_moe':
+                from vllm.model_executor.layers.quantization.patches.deepseek_v3_moe_patch import \
+                    restore_deepseek_v3_moe_patch
+                restore_deepseek_v3_moe_patch()
+        except Exception as e:
+            logger.warning(f"Failed to restore patch {patch_name}: {e}")
+
+
+def get_moe_layer_strategy_mapping(moe_info: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Get layer strategy mapping for different MoE architectures
+    Enhanced for vLLM compatibility
+    """
+    base_mapping = {
+        "q_proj": "q_proj",
+        "k_proj": "k_proj",
+        "v_proj": "v_proj",
+        "o_proj": "o_proj",
+        "gate_proj": "gate_proj",
+        "up_proj": "up_proj",
+        "down_proj": "down_proj",
+    }
+
+    if moe_info['type'] == 'deepseek_v3_moe':
+        # Add DeepSeek V3 specific mappings
+        deepseek_mapping = {
+            "q_a_proj": "q_a_proj",
+            "q_b_proj": "q_b_proj",
+            "kv_a_proj_with_mqa": "kv_a_proj_with_mqa",
+            "kv_b_proj": "kv_b_proj",
+            "moe_shared_expert_gate_proj": "moe_shared_expert_gate_proj",
+            "moe_shared_expert_up_proj": "moe_shared_expert_up_proj",
+            "moe_shared_expert_down_proj": "moe_shared_expert_down_proj",
+        }
+        base_mapping.update(deepseek_mapping)
+
+    elif moe_info['type'] == 'qwen3_moe':
+        # Add Qwen3 MoE specific mappings for vLLM
+        qwen3_mapping = {
+            "moe_gate": "moe_gate",
+            "moe_expert_gate_proj": "moe_expert_gate_proj",
+            "moe_expert_up_proj": "moe_expert_up_proj",
+            "moe_expert_down_proj": "moe_expert_down_proj",
+        }
+        base_mapping.update(qwen3_mapping)
+
+    return base_mapping
+
+
+# vLLM integration utilities
+def is_vllm_fused_moe_layer(layer_name: str) -> bool:
+    """Check if this is a vLLM FusedMoE layer"""
+    return 'experts.' in layer_name and any(proj in layer_name for proj in ['gate_proj', 'up_proj', 'down_proj'])
+
+
+def get_vllm_expert_id_from_name(layer_name: str) -> Optional[int]:
+    """Extract expert ID from vLLM layer name like 'experts.0.gate_proj'"""
+    import re
+    match = re.search(r'experts\.(\d+)\.', layer_name)
+    return int(match.group(1)) if match else None
 
 
 def fix_qwen3_rope_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -271,128 +446,3 @@ def load_config_with_rope_fix(model_path: str):
             return config
         else:
             raise e
-
-
-def get_moe_layer_strategy_mapping(moe_info: Dict[str, Any]) -> Dict[str, str]:
-    """
-    Get layer strategy mapping for different MoE architectures
-    """
-    base_mapping = {
-        "q_proj": "q_proj",
-        "k_proj": "k_proj",
-        "v_proj": "v_proj",
-        "o_proj": "o_proj",
-        "gate_proj": "gate_proj",
-        "up_proj": "up_proj",
-        "down_proj": "down_proj",
-    }
-
-    if moe_info['type'] == 'deepseek_v3_moe':
-        # Add DeepSeek V3 specific mappings
-        deepseek_mapping = {
-            "q_a_proj": "q_a_proj",
-            "q_b_proj": "q_b_proj",
-            "kv_a_proj_with_mqa": "kv_a_proj_with_mqa",
-            "kv_b_proj": "kv_b_proj",
-            "moe_gate": "moe_gate",
-            "moe_shared_expert_gate_proj": "moe_shared_expert_gate_proj",
-            "moe_shared_expert_up_proj": "moe_shared_expert_up_proj",
-            "moe_shared_expert_down_proj": "moe_shared_expert_down_proj",
-            "moe_expert_gate_proj": "moe_expert_gate_proj",
-            "moe_expert_up_proj": "moe_expert_up_proj",
-            "moe_expert_down_proj": "moe_expert_down_proj",
-        }
-        base_mapping.update(deepseek_mapping)
-
-    elif moe_info['type'] == 'qwen3_moe':
-        # Add Qwen3 MoE specific mappings
-        qwen3_mapping = {
-            "moe_gate": "moe_gate",
-            "moe_expert_gate_proj": "moe_expert_gate_proj",
-            "moe_expert_up_proj": "moe_expert_up_proj",
-            "moe_expert_down_proj": "moe_expert_down_proj",
-        }
-        if moe_info['has_shared_experts']:
-            qwen3_mapping.update({
-                "moe_shared_expert_gate_proj": "moe_shared_expert_gate_proj",
-                "moe_shared_expert_up_proj": "moe_shared_expert_up_proj",
-                "moe_shared_expert_down_proj": "moe_shared_expert_down_proj",
-            })
-        base_mapping.update(qwen3_mapping)
-
-    return base_mapping
-
-
-def should_quantize_moe_layer(layer_name: str, layer_module, moe_info: Dict[str, Any]) -> bool:
-    """
-    Determine if a MoE layer should be quantized
-    """
-
-    # Only quantize Linear layers
-    if not isinstance(layer_module, nn.Linear):
-        return False
-
-    # Skip embedding and normalization layers
-    skip_patterns = [
-        "embed_tokens", "embed_positions", "layernorm", "norm", "lm_head"
-    ]
-
-    layer_name_lower = layer_name.lower()
-    if any(pattern in layer_name_lower for pattern in skip_patterns):
-        return False
-
-    # For MoE models, be more selective
-    if moe_info['type'] != 'standard':
-        # Skip very small layers
-        if hasattr(layer_module, 'in_features') and hasattr(layer_module, 'out_features'):
-            if layer_module.in_features < 32 or layer_module.out_features < 32:
-                return False
-
-        # For models with many experts, might want to skip some layers based on strategy
-        if moe_info['experts_count'] > 50:  # Large expert count like DeepSeek V3
-            # Could implement more selective quantization here based on strategy
-            pass
-
-    return True
-
-def apply_moe_patches(moe_info: Dict[str, Any]) -> List[str]:
-    """Apply patches for MoE models based on type."""
-    applied_patches = []
-
-    if not moe_info['needs_patch']:
-        return applied_patches
-
-    try:
-        if moe_info['type'] == 'qwen3_moe':
-            from vllm.model_executor.layers.quantization.patches.qwen3_moe_patch import apply_qwen3_moe_patch
-            strategy = 'adaptive'
-            if apply_qwen3_moe_patch(strategy):
-                applied_patches.append('qwen3_moe')
-                logger.info(f"Applied Qwen3 MoE patch with {strategy} strategy")
-
-        elif moe_info['type'] == 'deepseek_v3_moe':
-            from vllm.model_executor.layers.quantization.patches.deepseek_v3_moe_patch import apply_deepseek_v3_moe_patch
-            strategy = 'hybrid' if moe_info['experts_count'] > 50 else 'conservative'
-            if apply_deepseek_v3_moe_patch(strategy):
-                applied_patches.append('deepseek_v3_moe')
-                logger.info(f"Applied DeepSeek V3 MoE patch with {strategy} strategy")
-
-    except Exception as e:
-        logger.warning(f"Failed to apply MoE patches: {e}")
-        restore_moe_patches(applied_patches)
-        applied_patches = []
-
-    return applied_patches
-
-def restore_moe_patches(applied_patches: List[str]):
-    """Restore/cleanup applied MoE patches."""
-    for patch_name in applied_patches:
-        try:
-            if patch_name == 'qwen3_moe':
-                from vllm.model_executor.layers.quantization.patches.qwen3_moe_patch import restore_qwen3_moe_patch
-                restore_qwen3_moe_patch()
-            elif patch_name == 'deepseek_v3_moe':
-                from vllm.model_executor.layers.quantization.patches.deepseek_v3_moe_patch import restore_deepseek_v3_moe_patch
-                restore_deepseek_v3_moe_patch()
-        except Exception as e:
-            logger.warning(f"Failed to restore patch {patch_name}: {e}")

@@ -405,7 +405,7 @@ class Qwen2Model(nn.Module):
                 loaded_params.add(scale_name)
                 continue
 
-            # 尝试参数映射（仅当使用融合层时）
+            # Try parameter mapping (only when using fusion layers)
             mapped = False
             if use_stacked_mapping:
                 for (param_name, weight_name, shard_id) in stacked_params_mapping:
@@ -426,7 +426,6 @@ class Qwen2Model(nn.Module):
                         break
 
             if not mapped:
-                # 直接加载，不进行映射
                 original_name = name
 
                 # Skip loading extra bias for GPTQ models.
@@ -441,26 +440,8 @@ class Qwen2Model(nn.Module):
                 if is_pp_missing_parameter(name, self):
                     continue
 
-                # 检查参数是否存在
                 if name not in params_dict:
-                    # 如果参数不存在，尝试一些变通方法
-                    logger.warning(
-                        f"Parameter {name} not found in model. Available parameters starting with similar pattern:")
-
-                    # 查找类似的参数名
-                    similar_params = []
-                    name_parts = name.split('.')
-                    if len(name_parts) >= 2:
-                        search_pattern = '.'.join(name_parts[:-1])  # 去掉最后一部分
-                        for param_name in params_dict.keys():
-                            if search_pattern in param_name:
-                                similar_params.append(param_name)
-
-                    if similar_params:
-                        logger.warning(f"Similar parameters found: {similar_params[:5]}...")  # 只显示前5个
-
-                    # 跳过这个权重
-                    logger.warning(f"Skipping weight: {original_name}")
+                    logger.warning(f"Parameter {name} not found, skipping")
                     continue
 
                 param = params_dict[name]
