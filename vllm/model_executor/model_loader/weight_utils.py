@@ -843,7 +843,12 @@ def load_gba_strategy_config(model_path: str) -> Optional[Dict[str, Any]]:
 
 
 def detect_gba_quantization(model_path: str, config: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
-    """Detect if the model uses GBA quantization and extract configuration."""
+    """
+    Detect if model uses GBA quantization and return configuration
+    Integration point for vLLM's weight loading system
+    """
+
+    logger.info(f"=== Checking for GBA quantization: {model_path} ===")
 
     # Check model name patterns
     model_name = str(model_path)

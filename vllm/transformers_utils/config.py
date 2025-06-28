@@ -383,7 +383,6 @@ def get_config(
     if trust_remote_code:
         maybe_register_config_serialize_by_value()
 
-    # 新增：尝试增强配置以支持 GBA 量化
     try:
         config = enhance_config_with_quantization(config, str(model))
     except Exception as e:
@@ -595,30 +594,53 @@ def get_sentence_transformer_tokenizer_config(model: str,
     return None
 
 def enhance_config_with_quantization(config, model_path: str):
-    """Enhance model configuration with quantization information."""
+    """
+    Enhanced configuration function that detects and applies GBA quantization
+
+    This function should be called during model configuration setup,
+    typically in the get_config() function in config.py
+    """
     from vllm.model_executor.model_loader.weight_utils import detect_gba_quantization
 
     config_dict = config.to_dict()
     is_gba, gba_config = detect_gba_quantization(str(model_path), config_dict)
 
     if is_gba:
-        # 直接在 config_dict 中设置 quantization_config
         config_dict["quantization_config"] = gba_config
         config_dict["quantization"] = "gba"
 
-        # 重新创建配置对象
+        # For MoE models, ensure separated architecture
+        if gba_config.get("moe_info", {}).get("type") != "standard":
+            config_dict.update({
+                "_gba_moe_mode": True,
+                "_force_separated_architecture": True,
+            })
+            logger.info("Applied GBA MoE separated architecture mode")
+
         try:
             enhanced_config = config.__class__.from_dict(config_dict)
-            # logger.info(
-            #     f"Enhanced config with GBA quantization: "
-            #     f"bits={gba_config.get('weight_bits', 4)}, "
-            #     f"group_size={gba_config.get('group_size', 128)}")
+            # Set additional attributes directly
+            enhanced_config.quantization_config = gba_config
+            enhanced_config._gba_quantization = True
+
+            if gba_config.get("moe_info"):
+                enhanced_config._gba_moe_mode = True
+
+            # Log summary
+            log_quantization_summary(enhanced_config, model_path)
+
+            logger.info("✅ Successfully created GBA enhanced configuration")
             return enhanced_config
         except Exception as e:
-            logger.warning(f"Failed to create enhanced config: {e}, using original config")
-            # 直接设置属性作为备选方案
+            logger.warning(f"Failed to create enhanced config: {e}")
+            # Fallback: set attributes directly
             config.quantization_config = gba_config
-            logger.info(f"Set quantization_config attribute directly")
+            config._gba_quantization = True
+
+            if gba_config.get("moe_info"):
+                config._gba_moe_mode = True
+
+            logger.info("✅ Applied GBA configuration as fallback")
             return config
 
     return config

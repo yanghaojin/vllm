@@ -8,99 +8,11 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.logger import init_logger
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.gba_moe_support import apply_moe_patches, apply_moe_quant_strategy
-from vllm.model_executor.layers.fused_moe.layer import FusedMoEMethodBase, UnquantizedFusedMoEMethod
+from vllm.distributed import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
+
 
 logger = init_logger(__name__)
 
-
-class GBAFusedMoEMethod(FusedMoEMethodBase):
-    """GBA quantization method for FusedMoE layers - simplified version"""
-
-    def __init__(self, quant_config):
-        super().__init__()
-        self.quant_config = quant_config
-        self._fallback_method = None
-
-    def create_weights(
-            self,
-            layer: torch.nn.Module,
-            num_experts: int,
-            hidden_size: int,
-            intermediate_size_per_partition: int,
-            params_dtype: torch.dtype,
-            **extra_weight_attrs,
-    ):
-        """Create weights for MoE experts - using fallback method for now"""
-
-        logger.info(f"Creating GBA MoE weights (fallback): experts={num_experts}, "
-                    f"hidden={hidden_size}, intermediate={intermediate_size_per_partition}")
-
-        # 直接创建标准的未量化权重
-        # 这确保了与权重文件的兼容性
-
-        # Fused gate_up_proj (column parallel)
-        w13_weight = torch.nn.Parameter(torch.empty(
-            num_experts,
-            2 * intermediate_size_per_partition,
-            hidden_size,
-            dtype=params_dtype),
-            requires_grad=False)
-        layer.register_parameter("w13_weight", w13_weight)
-        set_weight_attrs(w13_weight, extra_weight_attrs)
-
-        # down_proj (row parallel)
-        w2_weight = torch.nn.Parameter(torch.empty(
-            num_experts,
-            hidden_size,
-            intermediate_size_per_partition,
-            dtype=params_dtype),
-            requires_grad=False)
-        layer.register_parameter("w2_weight", w2_weight)
-        set_weight_attrs(w2_weight, extra_weight_attrs)
-
-        logger.info("Created standard MoE weights (no quantization for now)")
-
-    def apply(
-            self,
-            layer: torch.nn.Module,
-            x: torch.Tensor,
-            router_logits: torch.Tensor,
-            top_k: int,
-            renormalize: bool,
-            use_grouped_topk: bool = False,
-            topk_group: Optional[int] = None,
-            num_expert_group: Optional[int] = None,
-            global_num_experts: int = -1,
-            expert_map: Optional[torch.Tensor] = None,
-            custom_routing_function: Optional[Callable] = None,
-            scoring_func: str = "softmax",
-            e_score_correction_bias: Optional[torch.Tensor] = None,
-            apply_router_weight_on_input: bool = False,
-            activation: str = "silu",
-    ) -> torch.Tensor:
-        """Apply MoE forward pass - using fallback for now"""
-
-        if self._fallback_method is None:
-            raise RuntimeError("Fallback method not initialized")
-
-        # 委托给未量化方法处理
-        return self._fallback_method.apply(
-            layer=layer,
-            x=x,
-            router_logits=router_logits,
-            top_k=top_k,
-            renormalize=renormalize,
-            use_grouped_topk=use_grouped_topk,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            e_score_correction_bias=e_score_correction_bias,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            activation=activation,
-        )
 
 class GBAConfig(QuantizationConfig):
     """GBA quantization configuration class"""
@@ -116,6 +28,9 @@ class GBAConfig(QuantizationConfig):
         self.group_size = group_size
         self.use_mbw = use_mbw
         self.strategy = strategy or {}
+
+        self._moe_info = None
+        self._moe_detected = False
 
         # Validate parameters
         if self.weight_bits not in [2, 3, 4, 5, 6, 8]:
@@ -174,11 +89,10 @@ class GBAConfig(QuantizationConfig):
         # Add MoE info if present and apply patches
         if 'moe_info' in config:
             instance.moe_info = config['moe_info']
+            instance._config_dict = config
 
             logger.info(f"MoE info detected: {instance.moe_info}")
 
-            # Apply MoE patches if needed
-            from vllm.model_executor.layers.quantization.gba_moe_support import apply_moe_patches
             try:
                 applied_patches = apply_moe_patches(instance.moe_info)
                 instance.applied_moe_patches = applied_patches
@@ -190,36 +104,22 @@ class GBAConfig(QuantizationConfig):
 
         return instance
 
-    def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> Optional[Union["GBALinearMethod", "GBAFusedMoEMethod"]]:
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> Optional[Union["GBALinearMethod"]]:
         """return quantization method"""
 
-        # 处理普通Linear层
+        # normal Linear
         if isinstance(layer, LinearBase):
             logger.debug(f"Creating GBA linear method for layer: {prefix}")
             return GBALinearMethod(self)
 
-        # 处理FusedMoE层 - 优先级最高
-        try:
-            from vllm.model_executor.layers.fused_moe.layer import FusedMoE
-            if isinstance(layer, FusedMoE):
-                logger.debug(f"Creating GBA FusedMoE method for layer: {prefix}")
-                return GBAFusedMoEMethod(self)
-        except ImportError:
-            pass
+        # Handle MoE-related layers if MoE support is available
+        moe_patterns = [
+            'experts', 'gate_proj', 'up_proj', 'down_proj', 'mlp.gate',
+            'shared_experts', 'moe_gate'
+        ]
 
-        # 处理MoE专家层的模式匹配（作为后备）
-        if 'experts' in prefix and any(proj in prefix for proj in ['gate_proj', 'up_proj', 'down_proj']):
-            logger.debug(f"Creating GBA linear method for MoE expert layer: {prefix}")
-            return GBALinearMethod(self)
-
-        # 处理MoE门控层
-        if 'gate' in prefix and 'experts' not in prefix:
-            logger.debug(f"Creating GBA linear method for MoE gate layer: {prefix}")
-            return GBALinearMethod(self)
-
-        # 处理包含'mlp'的层（可能是MoE相关）
-        if 'mlp' in prefix.lower():
-            logger.debug(f"Creating GBA linear method for MLP layer: {prefix}")
+        if any(pattern in prefix for pattern in moe_patterns):
+            logger.debug(f"Creating GBA linear method for MoE-related layer: {prefix}")
             return GBALinearMethod(self)
 
         logger.debug(f"No quantization method for layer: {prefix} (type: {type(layer).__name__})")
@@ -293,22 +193,11 @@ class GBALinearMethod(LinearMethodBase):
         # layer specific config
         layer_prefix = extra_weight_attrs.get("prefix", "")
 
-        logger.debug(f"Creating GBA weights for layer: {layer_prefix}")
-        logger.debug(f"  input_size_per_partition: {input_size_per_partition}")
-        logger.debug(f"  output_size_per_partition: {output_size_per_partition}")
-
         is_moe_expert = 'mlp.experts.' in layer_prefix and any(
             proj in layer_prefix for proj in ['gate_proj', 'up_proj', 'down_proj'])
+
         is_moe_gate = (layer_prefix.endswith('mlp.gate') or
                        'mlp.gate.' in layer_prefix) and 'experts' not in layer_prefix
-
-        if is_moe_expert:
-            logger.debug(f"Detected MoE expert layer: {layer_prefix}")
-            # 对于MoE专家层，暂时跳过GBA量化
-            logger.warning(f"Skipping GBA quantization for MoE expert layer: {layer_prefix}")
-            return
-        elif is_moe_gate:
-            logger.debug(f"Detected MoE gate layer: {layer_prefix}")
 
         layer_config = self._get_layer_config(layer_prefix)
 
@@ -330,10 +219,6 @@ class GBALinearMethod(LinearMethodBase):
 
         # Create quantization scales and zero points
         scale_zero_shape = (num_groups, output_size_per_partition)
-
-        logger.debug(f"Creating parameter shapes:")
-        logger.debug(f"  qweight: {qweight_shape}")
-        logger.debug(f"  scales/zeros: {scale_zero_shape}")
 
         # Create quantized weights
         qweight = torch.nn.Parameter(
@@ -381,21 +266,17 @@ class GBALinearMethod(LinearMethodBase):
             "weight_loader": gba_weight_loader
         })
 
-        if not is_moe_expert and not is_moe_gate:
-            logger.debug(f"Creating channel_scale for regular layer: {layer_prefix}")
-            channel_scale = torch.nn.Parameter(
-                torch.ones((1, 1, input_size_per_partition), dtype=params_dtype, device="cuda"),
-                requires_grad=False,
-            )
-            channel_scale._param_name = "channel_scale"
-            set_weight_attrs(channel_scale, {
-                "input_dim": 2,
-                "output_dim": -1,
-                "weight_loader": gba_weight_loader
-            })
-            layer.register_parameter("channel_scale", channel_scale)
-        else:
-            logger.debug(f"Skipping channel_scale creation for MoE layer: {layer_prefix}")
+        channel_scale = torch.nn.Parameter(
+            torch.ones((1, 1, input_size_per_partition), dtype=params_dtype, device="cuda"),
+            requires_grad=False,
+        )
+        channel_scale._param_name = "channel_scale"
+        set_weight_attrs(channel_scale, {
+            "input_dim": 2,
+            "output_dim": -1,
+            "weight_loader": gba_weight_loader
+        })
+        layer.register_parameter("channel_scale", channel_scale)
 
         # Mixed bit-width mode requires additional parameters
         if self.quant_config.use_mbw:
@@ -485,14 +366,26 @@ class GBALinearMethod(LinearMethodBase):
         return f"unknown_{param_dim}d_{param_dtype}"
 
     def _gba_weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor, param_name: str) -> None:
-        """GBA quantized weight loader implementation"""
+        """GBA quantized weight loader implementation with debugging"""
 
         logger.debug(f"Loading GBA weight: {param_name}")
         logger.debug(f"  Param shape: {param.shape}, Loaded shape: {loaded_weight.shape}")
 
         def ensure_dtype(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
             if tensor.dtype != dtype:
-                return tensor.to(dtype)
+                logger.debug(f"Converting dtype from {tensor.dtype} to {dtype}")
+                converted = tensor.to(dtype)
+
+                # 检查dtype转换是否引入了问题
+                if 'scale' in param_name.lower():
+                    after_conversion_invalid = torch.any(converted <= 0)
+                    before_conversion_invalid = torch.any(tensor <= 0)
+                    if after_conversion_invalid and not before_conversion_invalid:
+                        logger.error(f"Dtype conversion introduced invalid values in {param_name}!")
+                        logger.error(f"Before: min={torch.min(tensor)}, max={torch.max(tensor)}")
+                        logger.error(f"After: min={torch.min(converted)}, max={torch.max(converted)}")
+
+                return converted
             return tensor
 
         def ensure_shape(tensor: torch.Tensor, target_shape: torch.Size, param_name: str) -> torch.Tensor:
@@ -501,7 +394,52 @@ class GBALinearMethod(LinearMethodBase):
 
             if tensor.numel() == target_shape.numel():
                 logger.debug(f"Reshaping {param_name}: {tensor.shape} -> {target_shape}")
-                return tensor.view(target_shape)
+                reshaped = tensor.view(target_shape)
+
+                # check if reshape causing problem
+                if 'scale' in param_name.lower():
+                    after_reshape_invalid = torch.any(reshaped <= 0)
+                    before_reshape_invalid = torch.any(tensor <= 0)
+                    if after_reshape_invalid and not before_reshape_invalid:
+                        logger.error(f"Reshape introduced invalid values in {param_name}!")
+
+                return reshaped
+
+            # 张量并行处理（保持原有逻辑）
+            if param_name in ["qweight", "scales", "zeros"] and len(tensor.shape) == 2 and len(target_shape) == 2:
+                tensor_h, tensor_w = tensor.shape
+                target_h, target_w = target_shape
+
+                logger.info(f"Attempting TP-aware shape adjustment for {param_name}")
+                logger.info(f"  tensor: {tensor_h} x {tensor_w}")
+                logger.info(f"  target: {target_h} x {target_w}")
+
+                if tensor_h == target_h and tensor_w != target_w:
+                    tp_size = get_tensor_model_parallel_world_size()
+                    logger.info(f"  TP size: {tp_size}")
+
+                    if tensor_w * tp_size == target_w:
+                        result = torch.zeros(target_shape, dtype=tensor.dtype, device=tensor.device)
+                        tp_rank = get_tensor_model_parallel_rank()
+                        start_idx = tp_rank * tensor_w
+                        end_idx = start_idx + tensor_w
+                        result[:, start_idx:end_idx] = tensor
+                        logger.info(f"Expanded {param_name} using TP rank {tp_rank}: [{start_idx}:{end_idx}]")
+                        return result
+                    elif target_w * tp_size == tensor_w:
+                        tp_rank = get_tensor_model_parallel_rank()
+                        start_idx = tp_rank * target_w
+                        end_idx = start_idx + target_w
+                        result = tensor[:, start_idx:end_idx].contiguous()
+                        logger.info(f"Sliced {param_name} using TP rank {tp_rank}: [{start_idx}:{end_idx}]")
+                        return result
+
+            # 如果无法处理，提供详细错误信息
+            logger.error(f"Cannot handle shape mismatch for {param_name}")
+            logger.error(f"  Param shape: {target_shape} ({target_shape.numel()} elements)")
+            logger.error(f"  Loaded shape: {tensor.shape} ({tensor.numel()} elements)")
+            logger.error(f"  TP size: {get_tensor_model_parallel_world_size()}")
+            logger.error(f"  TP rank: {get_tensor_model_parallel_rank()}")
 
             raise ValueError(
                 f"Shape mismatch for {param_name}:\n"
@@ -510,24 +448,16 @@ class GBALinearMethod(LinearMethodBase):
                 f"  This indicates a mismatch between model architecture and weight file."
             )
 
-        loaded_weight = ensure_dtype(loaded_weight, param.dtype)
-        shaped_weight = ensure_shape(loaded_weight, param.shape, param_name)
+        try:
+            loaded_weight = ensure_dtype(loaded_weight, param.dtype)
+            shaped_weight = ensure_shape(loaded_weight, param.shape, param_name)
 
-        if 'scale' in param_name.lower():
-            if torch.all(shaped_weight == 0):
-                logger.warning(f"Warning: {param_name} is all zeros! Fixing...")
-                shaped_weight = torch.where(shaped_weight == 0,
-                                            torch.ones_like(shaped_weight) * 1e-6,
-                                            shaped_weight)
-            elif torch.any(shaped_weight <= 0):
-                logger.warning(f"Warning: {param_name} has non-positive values! Fixing...")
-                shaped_weight = torch.where(shaped_weight <= 0,
-                                            torch.ones_like(shaped_weight) * 1e-6,
-                                            shaped_weight)
+            param.data.copy_(shaped_weight)
+            logger.debug(f"Successfully loaded {param_name}")
 
-        param.data.copy_(shaped_weight)
-
-        logger.debug(f"Successfully loaded {param_name}")
+        except Exception as e:
+            logger.error(f"Failed to load weight {param_name}: {e}")
+            raise e
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Processing after weight loading"""
@@ -541,11 +471,15 @@ class GBALinearMethod(LinearMethodBase):
         if hasattr(layer, '_gba_weights_processed'):
             return
 
-        # Check if necessary weights have been loaded
-        required_weights = ["qweight", "scales", "zeros", "q_perm", "channel_scale"]
-        for weight_name in required_weights:
-            if not hasattr(layer, weight_name):
-                raise ValueError(f"Missing required weight: {weight_name}")
+            # Check if necessary weights have been loaded
+            required_weights = ["qweight", "scales", "zeros", "q_perm"]
+            # channel_scale只对非MoE层是必需的
+            if not layer.is_moe_expert and not layer.is_moe_gate:
+                required_weights.append("channel_scale")
+
+            for weight_name in required_weights:
+                if not hasattr(layer, weight_name):
+                    raise ValueError(f"Missing required weight: {weight_name}")
 
         logger.debug(f"Processing GBA weights for layer with input_size={layer.input_size_per_partition}")
 
@@ -605,9 +539,6 @@ class GBALinearMethod(LinearMethodBase):
 
         # 检查是否是MoE层
         moe_info = getattr(self.quant_config, 'moe_info', {'type': 'standard'})
-
-        # 使用增强的MoE策略应用
-        from vllm.model_executor.layers.quantization.gba_moe_support import apply_moe_quant_strategy
 
         layer_strategy = apply_moe_quant_strategy(layer_prefix, strategy, moe_info)
 
@@ -844,3 +775,72 @@ class GBALinear(LinearBase):
         if self.skip_bias_add and bias is not None:
             return output, bias
         return output
+
+
+# MoE Patch 实现 - 基于 green-bit-llm 的思路
+class QuantizedQwen3MoE:
+    """量化友好的 Qwen3 MoE 前向传播实现"""
+
+    @staticmethod
+    def forward(self, hidden_states: torch.Tensor):
+        """参考 green-bit-llm 的 MoE patch 实现"""
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states_flat = hidden_states.view(-1, hidden_dim)
+
+        # 路由计算
+        router_logits, _ = self.gate(hidden_states_flat)
+
+        # 使用传统的专家逐个计算方式，与 GBA 量化兼容
+        routing_weights = torch.nn.functional.softmax(router_logits.float(), dim=-1)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights = routing_weights.to(hidden_states.dtype)
+
+        if self.norm_topk_prob:
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+
+        final_hidden_states = torch.zeros_like(hidden_states_flat)
+
+        # 逐token处理，确保与量化kernel兼容
+        for i in range(hidden_states_flat.size(0)):
+            token_input = hidden_states_flat[i:i + 1]
+            token_output = torch.zeros_like(token_input)
+
+            for j in range(self.top_k):
+                expert_idx = selected_experts[i, j].item()
+                expert_weight = routing_weights[i, j].item()
+
+                if expert_weight > 1e-6:
+                    # 这里调用的是独立的专家层，每个都是 GBALinearMethod
+                    expert_output = self.experts[expert_idx](token_input)
+                    token_output += expert_output * expert_weight
+
+            final_hidden_states[i] = token_output[0]
+
+        return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
+
+
+def apply_gba_moe_patches():
+    """应用 GBA 量化友好的 MoE patches"""
+    try:
+        # Qwen3 MoE patch
+        from vllm.model_executor.models.qwen3_moe import Qwen3MoeSparseMoeBlock
+        if not hasattr(Qwen3MoeSparseMoeBlock, '_original_forward'):
+            Qwen3MoeSparseMoeBlock._original_forward = Qwen3MoeSparseMoeBlock.forward
+        Qwen3MoeSparseMoeBlock.forward = QuantizedQwen3MoE.forward
+        logger.info("Applied GBA-compatible Qwen3 MoE patch")
+        return True
+    except ImportError:
+        logger.warning("Qwen3 MoE models not available, skipping patch")
+        return False
+
+
+def restore_gba_moe_patches():
+    """恢复原始的 MoE 前向传播方法"""
+    try:
+        from vllm.model_executor.models.qwen3_moe import Qwen3MoeSparseMoeBlock
+        if hasattr(Qwen3MoeSparseMoeBlock, '_original_forward'):
+            Qwen3MoeSparseMoeBlock.forward = Qwen3MoeSparseMoeBlock._original_forward
+            delattr(Qwen3MoeSparseMoeBlock, '_original_forward')
+            logger.info("Restored original Qwen3 MoE forward method")
+    except ImportError:
+        pass

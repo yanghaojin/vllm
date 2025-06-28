@@ -8,7 +8,6 @@ logger = init_logger(__name__)
 try:
     from vllm.model_executor.layers.quantization.gba import GBAConfig, GBALinearMethod
     from vllm.model_executor.layers.quantization.gba_moe_support import (
-        should_quantize_moe_layer, get_moe_layer_strategy_mapping,
         apply_moe_patches, restore_moe_patches
     )
     GBA_AVAILABLE = True
