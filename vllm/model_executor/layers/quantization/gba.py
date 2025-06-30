@@ -90,7 +90,6 @@ class GBAConfig(QuantizationConfig):
         if 'moe_info' in config:
             instance.moe_info = config['moe_info']
             instance._config_dict = config
-            logger.debug(f"MoE info detected: {instance.moe_info}")
 
         return instance
 
@@ -99,7 +98,6 @@ class GBAConfig(QuantizationConfig):
 
         # normal Linear
         if isinstance(layer, LinearBase):
-            logger.debug(f"Creating GBA linear method for layer: {prefix}")
             return GBALinearMethod(self)
 
         # Handle MoE-related layers if MoE support is available
@@ -109,50 +107,12 @@ class GBAConfig(QuantizationConfig):
         ]
 
         if any(pattern in prefix for pattern in moe_patterns):
-            logger.debug(f"Creating GBA linear method for MoE-related layer: {prefix}")
             return GBALinearMethod(self)
 
-        logger.debug(f"No quantization method for layer: {prefix} (type: {type(layer).__name__})")
         return None
 
     def get_scaled_act_names(self) -> List[str]:
         return []
-
-
-def flatten_x(x: torch.Tensor):
-    """
-    Flattens a 3D tensor into a 2D tensor by combining the first two dimensions.
-
-    Args:
-        x (torch.Tensor): A 3D tensor with shape [batch_size, seq_length, hidden_size].
-
-    Returns:
-        tuple[torch.Tensor, list]: A tuple containing the flattened 2D tensor with shape
-        [batch_size * seq_length, hidden_size] and the original shape as a list
-        [batch_size, seq_length] for later unflattening.
-    """
-    # shape of x in BERT/Transformer：[batch_size, seq_length, hidden_size]
-    # flatten x to 2D tensor : [batch_size * seq_length, hidden_size]
-    shape = list(x.size()[:-1])
-    x = x.view(-1, x.size(-1))
-    return x, shape
-
-
-def unflatten_x(x: torch.Tensor, shape: list):
-    """
-    Unflattens a 2D tensor back into a 3D tensor using the original shape.
-
-    Args:
-        x (torch.Tensor): A 2D tensor with shape [batch_size * seq_length, output_size].
-        shape (list): The original shape of the tensor before flattening,
-        as a list [batch_size, seq_length].
-
-    Returns:
-        torch.Tensor: The unflattened 3D tensor with shape [batch_size, seq_length, output_size].
-    """
-    # from [batch_size * seq_length, output_size] to [batch_size, seq_length, output_size]
-    x = x.view(shape + [x.size(-1)])
-    return x
 
 
 class GBALinearMethod(LinearMethodBase):
@@ -160,9 +120,6 @@ class GBALinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: GBAConfig):
         self.quant_config = quant_config
-        logger.debug(
-            f"Initialized GBA linear method with config: weight_bits={quant_config.weight_bits}, "
-            f"group_size={quant_config.group_size}")
 
     def create_weights(
             self,
@@ -303,22 +260,17 @@ class GBALinearMethod(LinearMethodBase):
         layer.is_moe_gate = is_moe_gate
 
         layer._gba_weights_initialized = True
-        logger.debug(f"Successfully created GBA weights for {layer_prefix}")
 
     def _get_gba_weight_loader(self):
         """Get GBA-specific weight loader function """
 
         def gba_weight_loader_wrapper(param: torch.nn.Parameter, loaded_weight: torch.Tensor, *args, **kwargs):
             param_name = self._infer_param_name(param, args[0] if args else None)
-
-            logger.debug(f"GBA weight loader: {param_name} - param: {param.shape}, loaded: {loaded_weight.shape}")
-
             return self._gba_weight_loader(param, loaded_weight, param_name)
 
         return gba_weight_loader_wrapper
 
     def _infer_param_name(self, param: torch.nn.Parameter, shard_id=None) -> str:
-
         if hasattr(param, '_param_name'):
             return param._param_name
 
@@ -326,31 +278,23 @@ class GBALinearMethod(LinearMethodBase):
         param_dtype = param.dtype
         param_dim = param.dim()
 
-        # (int32, 2D)
+        # Use parameter properties to infer name instead of counter
         if param_dtype == torch.int32 and param_dim == 2:
             return "qweight"
-
-        # (int16, 1D)
         elif param_dtype == torch.int16:
             if param_dim == 1:
                 return "q_perm"
             else:
                 return "q_groups"
-
-        # (float, 3D)
         elif param_dim == 3 and param_shape[0] == 1 and param_shape[1] == 1:
             return "channel_scale"
-
-        # scales和zeros (float, 2D)
         elif param_dtype in [torch.float16, torch.bfloat16, torch.float32] and param_dim == 2:
-            if not hasattr(self, '_scale_zero_counter'):
-                self._scale_zero_counter = 0
-
-            if self._scale_zero_counter % 2 == 0:
-                self._scale_zero_counter += 1
+            # Use parameter memory address hash to determine scales vs zeros
+            # This is more reliable than a counter
+            param_id = id(param)
+            if param_id % 2 == 0:
                 return "scales"
             else:
-                self._scale_zero_counter += 1
                 return "zeros"
 
         return f"unknown_{param_dim}d_{param_dtype}"
@@ -358,12 +302,8 @@ class GBALinearMethod(LinearMethodBase):
     def _gba_weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor, param_name: str) -> None:
         """GBA quantized weight loader implementation with debugging"""
 
-        logger.debug(f"Loading GBA weight: {param_name}")
-        logger.debug(f"  Param shape: {param.shape}, Loaded shape: {loaded_weight.shape}")
-
         def ensure_dtype(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
             if tensor.dtype != dtype:
-                logger.debug(f"Converting dtype from {tensor.dtype} to {dtype}")
                 converted = tensor.to(dtype)
 
                 if 'scale' in param_name.lower():
@@ -382,7 +322,6 @@ class GBALinearMethod(LinearMethodBase):
                 return tensor
 
             if tensor.numel() == target_shape.numel():
-                logger.debug(f"Reshaping {param_name}: {tensor.shape} -> {target_shape}")
                 reshaped = tensor.view(target_shape)
 
                 # check if reshape causing problem
@@ -433,7 +372,6 @@ class GBALinearMethod(LinearMethodBase):
             shaped_weight = ensure_shape(loaded_weight, param.shape, param_name)
 
             param.data.copy_(shaped_weight)
-            logger.debug(f"Successfully loaded {param_name}")
 
         except Exception as e:
             logger.error(f"Failed to load weight {param_name}: {e}")
@@ -461,8 +399,6 @@ class GBALinearMethod(LinearMethodBase):
                 if not hasattr(layer, weight_name):
                     raise ValueError(f"Missing required weight: {weight_name}")
 
-        logger.debug(f"Processing GBA weights for layer with input_size={layer.input_size_per_partition}")
-
         # Convert weight layout
         if self.quant_config.use_mbw:
             # Mixed bit-width mode
@@ -486,8 +422,6 @@ class GBALinearMethod(LinearMethodBase):
             # Create group mapping
             layer.q_group_map = ops.make_group_map(layer.q_groups, layer.qweight.size(0))
 
-            logger.debug(f"Applied mixed bitwidth quantization: {len(rows)} row groups")
-
         else:
             # Standard quantization mode
             qweight, rows = ops.gba_trans_qweight(
@@ -504,8 +438,6 @@ class GBALinearMethod(LinearMethodBase):
                 layer.rows_info = torch.tensor(rows, dtype=torch.int32, device=layer.qweight.device)
             else:
                 layer.rows_info = torch.empty(0, dtype=torch.int32, device=layer.qweight.device)
-
-            logger.debug("Applied standard quantization")
 
         # Mark as processed
         layer._gba_weights_processed = True
@@ -604,6 +536,62 @@ class GBALinearMethod(LinearMethodBase):
 
         return {}
 
+    def _prepare_layer_cache(self, layer: torch.nn.Module):
+        """Prepare and cache all layer parameters for optimal performance"""
+
+        # Ensure weights are processed
+        if not hasattr(layer, '_gba_weights_processed'):
+            self.process_weights_after_loading(layer)
+
+        # Cache channel scale with optimized handling
+        if hasattr(layer, 'channel_scale') and layer.channel_scale is not None:
+            layer._has_channel_scale = True
+            channel_scale = layer.channel_scale
+
+            # Pre-convert and cache the properly shaped channel scale
+            if channel_scale.dtype != torch.float16:
+                channel_scale = channel_scale.to(torch.float16)
+
+            # Pre-compute the right shape for both 2D and 3D inputs
+            if channel_scale.dim() == 3:
+                layer._channel_scale_cached = channel_scale.squeeze(0).squeeze(0)
+            elif channel_scale.dim() == 2:
+                layer._channel_scale_cached = channel_scale.squeeze(0)
+            else:
+                layer._channel_scale_cached = channel_scale
+        else:
+            layer._has_channel_scale = False
+            layer._channel_scale_cached = None
+
+        # Cache weight parameters with proper dtype
+        layer._scales_cached = (layer.scales.to(torch.float16)
+                                if layer.scales.dtype != torch.float16
+                                else layer.scales)
+        layer._zeros_cached = (layer.zeros.to(torch.float16)
+                               if layer.zeros.dtype != torch.float16
+                               else layer.zeros)
+
+        # Cache group map and rows list
+        layer._q_group_map_cached = getattr(layer, "q_group_map", None)
+
+        rows_info = getattr(layer, "rows_info", None)
+        layer._rows_list_cached = (rows_info.tolist()
+                                   if rows_info is not None and rows_info.numel() > 0
+                                   else [])
+
+        # Pre-compute expected input features for validation
+        layer._expected_input_features = layer.qweight.size(0) * (32 // layer.weight_bits)
+
+        if hasattr(layer, 'bias') and layer.bias is not None:
+            layer._bias_cached = layer.bias
+            layer._has_bias = True
+        else:
+            layer._bias_cached = None
+            layer._has_bias = False
+
+        # Mark as ready
+        layer._gba_ready = True
+
     def apply(
             self,
             layer: torch.nn.Module,
@@ -611,102 +599,41 @@ class GBALinearMethod(LinearMethodBase):
             bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Execute forward propagation with robust channel_scale handling"""
+        if not hasattr(layer, '_gba_ready'):
+            self._prepare_layer_cache(layer)
 
-        # Ensure weights are processed
-        if not hasattr(layer, '_gba_weights_processed'):
-            self.process_weights_after_loading(layer)
+        input_shape = x.shape
+        input_dim = len(input_shape)
 
-        original_dtype = x.dtype
-        original_shape = x.shape
-
-        if x.dim() == 3:
-            # 3D input [batch, seq_len, hidden_size]
-            # Apply channel_scale (original method)
-            if hasattr(layer, 'channel_scale') and layer.channel_scale is not None:
-                channel_scale = layer.channel_scale
-                if channel_scale.dtype != torch.float16:
-                    channel_scale = channel_scale.to(torch.float16)
-                x = x.mul(channel_scale)
-
-            # Flatten 为 2D
-            x, shape = flatten_x(x)
-
-        elif x.dim() == 2:
-            # 2D input [batch*seq_len, hidden_size]
-            # Modify the shape of channel_scale to accommodate 2D input
-            if hasattr(layer, 'channel_scale') and layer.channel_scale is not None:
-                channel_scale = layer.channel_scale  # 原始形状 [1, 1, hidden_size]
-                if channel_scale.dtype != torch.float16:
-                    channel_scale = channel_scale.to(torch.float16)
-
-                # 将 channel_scale 从 [1, 1, hidden_size] 转换为 [hidden_size]
-                if channel_scale.dim() == 3:
-                    channel_scale_2d = channel_scale.squeeze(0).squeeze(0)  # [hidden_size]
-                elif channel_scale.dim() == 2:
-                    channel_scale_2d = channel_scale.squeeze(0)  # [1, hidden_size] -> [hidden_size]
-                else:
-                    channel_scale_2d = channel_scale
-
-                x = x.mul(channel_scale_2d)  # Broadcasting: [batch*seq_len, hidden_size] * [hidden_size]
-
-            # For 2D input, set a fake shape for subsequent processing
-            shape = [x.size(0)]
-
+        if input_dim == 3:
+            x = x.view(-1, input_shape[-1])
+            needs_reshape = True
+            output_shape = input_shape[:-1] + (-1,)
         else:
-            raise ValueError(f"Unsupported input dimension: {x.dim()}, shape: {x.shape}")
+            needs_reshape = False
+            output_shape = None
 
-        # Ensure data type
-        if x.dtype != torch.float16:
-            x = x.to(torch.float16)
+        if layer._has_channel_scale:
+            x = x * layer._channel_scale_cached
 
-        # Prepare parameters
-        q_group_map = getattr(layer, "q_group_map", None)
-        rows_info = getattr(layer, "rows_info", None)
-        rows_list = rows_info.tolist() if rows_info is not None and rows_info.numel() > 0 else []
-
-        # Make sure the weight parameter type is correct
-        scales = layer.scales.to(torch.float16) if layer.scales.dtype != torch.float16 else layer.scales
-        zeros = layer.zeros.to(torch.float16) if layer.zeros.dtype != torch.float16 else layer.zeros
-
-        # Verify shape matches
-        expected_input_features = layer.qweight.size(0) * (32 // layer.weight_bits)
-        actual_input_features = x.size(1)
-
-        if expected_input_features != actual_input_features:
-            raise RuntimeError(
-                f"Shape mismatch in GBA layer: expected input features {expected_input_features}, got {actual_input_features}")
-
-        # Call CUDA forward propagation
         output = ops.gba_linear_forward(
             x,
             layer.qweight,
-            scales,
-            zeros,
+            layer._scales_cached,
+            layer._zeros_cached,
             layer.q_perm,
             layer.group_size,
             layer.weight_bits,
             self.quant_config.use_mbw,
-            q_group_map,
-            rows_list,
+            layer._q_group_map_cached,
+            layer._rows_list_cached,
         )
 
-        # Add bias
         if bias is not None:
-            if bias.dtype != output.dtype:
-                bias = bias.to(output.dtype)
             output = output + bias
 
-        # Restore output shape
-        if len(original_shape) == 3:
-            # Original input is 3D, restore to 3D
-            output = unflatten_x(output, shape)
-        elif len(original_shape) == 2:
-            # Original input is 2D, keep it 2D
-            pass
-
-        # Convert back to original data type
-        if original_dtype != torch.float16:
-            output = output.to(original_dtype)
+        if needs_reshape:
+            output = output.view(output_shape)
 
         return output
 

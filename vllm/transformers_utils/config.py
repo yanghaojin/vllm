@@ -593,10 +593,12 @@ def get_sentence_transformer_tokenizer_config(model: str,
         return encoder_dict
     return None
 
-
 def enhance_config_with_quantization(config, model_path: str):
-
-    if hasattr(config, '_gba_quantization') and config._gba_quantization:
+    """
+    Enhanced quantization config detection with improved error handling
+    """
+    # Skip if already enhanced
+    if getattr(config, '_gba_quantization', False):
         logger.debug("GBA configuration already enhanced, skipping")
         return config
 
@@ -605,27 +607,17 @@ def enhance_config_with_quantization(config, model_path: str):
 
         config_dict = config.to_dict()
 
-        if 'quantization_config' not in config_dict or not config_dict.get('quantization'):
-            is_gba, gba_config = detect_gba_quantization(str(model_path), config_dict)
-
-            if is_gba:
-                try:
-                    config.quantization_config = gba_config
-                    config.quantization = "gba"
-                    config._gba_quantization = True
-
-                    if gba_config.get("moe_info", {}).get("type") != "standard":
-                        config._gba_moe_mode = True
-                        config._force_separated_architecture = True
-
-                    return config
-
-                except Exception as e:
-                    logger.warning(f"Failed to apply GBA config: {e}")
-                    return config
-        else:
+        # Check if quantization is already configured
+        if _has_existing_quantization(config, config_dict):
             config._gba_quantization = True
             logger.debug("Using existing quantization configuration")
+            return config
+
+        # Detect GBA quantization
+        is_gba, gba_config = detect_gba_quantization(str(model_path), config_dict)
+
+        if is_gba:
+            return _apply_gba_config(config, gba_config)
 
         return config
 
@@ -634,6 +626,43 @@ def enhance_config_with_quantization(config, model_path: str):
         return config
     except Exception as e:
         logger.debug(f"Config enhancement failed: {e}")
+        return config
+
+
+def _has_existing_quantization(config, config_dict: dict) -> bool:
+    """Check if quantization is already configured"""
+    # Check for explicit GBA quantization
+    if (hasattr(config, 'quantization') and config.quantization == "gba" and
+            hasattr(config, 'hf_config') and getattr(config.hf_config, '_gba_quantization', False)):
+        return True
+
+    # Check for quantization config with GBA method
+    if 'quantization_config' in config_dict:
+        quant_config = config_dict['quantization_config']
+        return (isinstance(quant_config, dict) and
+                quant_config.get('quant_method') == 'gba')
+
+    return False
+
+
+def _apply_gba_config(config, gba_config: dict):
+    """Apply GBA configuration to the model config"""
+    try:
+        config.quantization_config = gba_config
+        config.quantization = "gba"
+        config._gba_quantization = True
+
+        # Handle MoE specific configurations
+        moe_info = gba_config.get("moe_info", {})
+        if moe_info.get("type") != "standard":
+            config._gba_moe_mode = True
+            config._force_separated_architecture = True
+            logger.debug(f"Enabled MoE mode: {moe_info.get('type')}")
+
+        return config
+
+    except Exception as e:
+        logger.warning(f"Failed to apply GBA config: {e}")
         return config
 
 def maybe_register_config_serialize_by_value() -> None:
