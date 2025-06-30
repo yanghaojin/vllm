@@ -13,7 +13,7 @@ from transformers import PretrainedConfig
 from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -217,12 +217,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
-        batch_size, hidden_dim = hidden_states.shape
 
-        # Router computation
+        # Router computation (保持不变)
         router_logits, _ = self.gate(hidden_states)
-
-        # Get routing weights and top-k experts
         routing_weights = torch.nn.functional.softmax(router_logits, dim=-1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
 
@@ -230,31 +227,51 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
 
         routing_weights = routing_weights.to(hidden_states.dtype)
+
+        expert_batch_inputs = {}
+        expert_batch_info = {}
+
+        # 第一遍：收集所有expert的输入
+        for expert_idx in range(self.num_experts):
+            expert_mask = (selected_experts == expert_idx)
+
+            if not expert_mask.any():
+                continue
+
+            token_indices, expert_positions = torch.where(expert_mask)
+
+            if len(token_indices) == 0:
+                continue
+
+            expert_inputs = hidden_states[token_indices]
+            expert_weights = routing_weights[token_indices, expert_positions]
+
+            # 批量存储该expert的所有输入
+            expert_batch_inputs[expert_idx] = expert_inputs  # [N, hidden_dim]
+            expert_batch_info[expert_idx] = {
+                'token_indices': token_indices,
+                'expert_positions': expert_positions,
+                'weights': expert_weights
+            }
+
+        if not expert_batch_inputs:
+            return torch.zeros_like(hidden_states).view(orig_shape)
+
         final_hidden_states = torch.zeros_like(hidden_states)
 
-        # Token-by-token processing - optimal for GBA quantization
-        for i in range(batch_size):
-            token_input = hidden_states[i:i + 1]  # [1, hidden_dim]
-            token_output = torch.zeros_like(token_input)
+        # 第二遍：批量调用每个expert（大幅减少调用次数）
+        for expert_idx, batch_inputs in expert_batch_inputs.items():
+            info = expert_batch_info[expert_idx]
 
-            # Process selected experts for this token
-            for j in range(self.top_k):
-                expert_idx = selected_experts[i, j].item()
-                expert_weight = routing_weights[i, j].item()
+            # 关键：一次性处理该expert的所有输入（而非逐token）
+            # 输入大小从 [1, hidden_dim] 变为 [N, hidden_dim]
+            batch_outputs = self.experts[expert_idx](batch_inputs)  # 单次GBA调用处理N个token
 
-                # Skip experts with very small weights
-                if expert_weight > 1e-6:
-                    # Call individual expert - uses GBA quantization
-                    expert_output = self.experts[expert_idx](token_input)
-                    token_output += expert_output * expert_weight
+            # 应用权重并累加到结果
+            weighted_outputs = batch_outputs * info['weights'].unsqueeze(-1)
 
-            final_hidden_states[i] = token_output[0]
-
-        # Handle tensor parallelism if needed
-        if self.tp_size > 1:
-            from vllm.distributed import get_tensor_model_parallel_group
-            import torch.distributed as dist
-            dist.all_reduce(final_hidden_states, group=get_tensor_model_parallel_group())
+            # 分发回原始位置
+            final_hidden_states.index_add_(0, info['token_indices'], weighted_outputs)
 
         return final_hidden_states.view(orig_shape)
 
@@ -581,8 +598,6 @@ class Qwen3MoeModel(nn.Module):
                 else:
                     raise
 
-        logger.info(f"Loaded {len(loaded_params)} parameters, skipped {len(skipped_params)}")
-
         if skipped_params:
             logger.debug(f"Skipped parameters: {sorted(list(skipped_params))}")
 
@@ -610,7 +625,6 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP):
 
         # Force detection of separated architecture
         if quant_config and quant_config.get_name() == "gba":
-            logger.info("GBA quantization detected - forcing SEPARATED architecture")
             # Ensure no fusion is attempted
             self.__class__.packed_modules_mapping = {}
 

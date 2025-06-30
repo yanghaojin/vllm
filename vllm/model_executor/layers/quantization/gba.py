@@ -7,7 +7,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.logger import init_logger
 from vllm import _custom_ops as ops
-from vllm.model_executor.layers.quantization.gba_moe_support import apply_moe_patches, apply_moe_quant_strategy
+from vllm.model_executor.layers.quantization.gba_moe_support import apply_moe_quant_strategy
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
 
 
@@ -90,17 +90,7 @@ class GBAConfig(QuantizationConfig):
         if 'moe_info' in config:
             instance.moe_info = config['moe_info']
             instance._config_dict = config
-
-            logger.info(f"MoE info detected: {instance.moe_info}")
-
-            try:
-                applied_patches = apply_moe_patches(instance.moe_info)
-                instance.applied_moe_patches = applied_patches
-                if applied_patches:
-                    logger.info(f"Applied MoE patches: {applied_patches}")
-            except Exception as e:
-                logger.warning(f"Failed to apply MoE patches: {e}")
-                instance.applied_moe_patches = []
+            logger.debug(f"MoE info detected: {instance.moe_info}")
 
         return instance
 
@@ -376,7 +366,6 @@ class GBALinearMethod(LinearMethodBase):
                 logger.debug(f"Converting dtype from {tensor.dtype} to {dtype}")
                 converted = tensor.to(dtype)
 
-                # 检查dtype转换是否引入了问题
                 if 'scale' in param_name.lower():
                     after_conversion_invalid = torch.any(converted <= 0)
                     before_conversion_invalid = torch.any(tensor <= 0)
@@ -405,18 +394,12 @@ class GBALinearMethod(LinearMethodBase):
 
                 return reshaped
 
-            # 张量并行处理（保持原有逻辑）
             if param_name in ["qweight", "scales", "zeros"] and len(tensor.shape) == 2 and len(target_shape) == 2:
                 tensor_h, tensor_w = tensor.shape
                 target_h, target_w = target_shape
 
-                logger.info(f"Attempting TP-aware shape adjustment for {param_name}")
-                logger.info(f"  tensor: {tensor_h} x {tensor_w}")
-                logger.info(f"  target: {target_h} x {target_w}")
-
                 if tensor_h == target_h and tensor_w != target_w:
                     tp_size = get_tensor_model_parallel_world_size()
-                    logger.info(f"  TP size: {tp_size}")
 
                     if tensor_w * tp_size == target_w:
                         result = torch.zeros(target_shape, dtype=tensor.dtype, device=tensor.device)
@@ -424,17 +407,14 @@ class GBALinearMethod(LinearMethodBase):
                         start_idx = tp_rank * tensor_w
                         end_idx = start_idx + tensor_w
                         result[:, start_idx:end_idx] = tensor
-                        logger.info(f"Expanded {param_name} using TP rank {tp_rank}: [{start_idx}:{end_idx}]")
                         return result
                     elif target_w * tp_size == tensor_w:
                         tp_rank = get_tensor_model_parallel_rank()
                         start_idx = tp_rank * target_w
                         end_idx = start_idx + target_w
                         result = tensor[:, start_idx:end_idx].contiguous()
-                        logger.info(f"Sliced {param_name} using TP rank {tp_rank}: [{start_idx}:{end_idx}]")
                         return result
 
-            # 如果无法处理，提供详细错误信息
             logger.error(f"Cannot handle shape mismatch for {param_name}")
             logger.error(f"  Param shape: {target_shape} ({target_shape.numel()} elements)")
             logger.error(f"  Loaded shape: {tensor.shape} ({tensor.numel()} elements)")
@@ -537,7 +517,6 @@ class GBALinearMethod(LinearMethodBase):
 
         strategy = self.quant_config.strategy
 
-        # 检查是否是MoE层
         moe_info = getattr(self.quant_config, 'moe_info', {'type': 'standard'})
 
         layer_strategy = apply_moe_quant_strategy(layer_prefix, strategy, moe_info)
@@ -545,14 +524,14 @@ class GBALinearMethod(LinearMethodBase):
         if layer_strategy:
             config = {}
 
-            # 提取weight_bits
+            # extract weight_bits
             if 'bits' in layer_strategy and layer_strategy['bits']:
                 if isinstance(layer_strategy['bits'], list):
                     config['weight_bits'] = layer_strategy['bits'][0]
                 else:
                     config['weight_bits'] = layer_strategy['bits']
 
-            # 提取group_size
+            # get group_size
             if 'group_size' in layer_strategy:
                 group_size_config = layer_strategy['group_size']
                 if isinstance(group_size_config, dict):
@@ -566,7 +545,7 @@ class GBALinearMethod(LinearMethodBase):
 
             return config
 
-        # 回退到原有逻辑
+        # fallback
         return self._get_layer_config_fallback(layer_prefix)
 
     def _get_layer_config_fallback(self, layer_prefix: str) -> Dict[str, Any]:
@@ -775,72 +754,3 @@ class GBALinear(LinearBase):
         if self.skip_bias_add and bias is not None:
             return output, bias
         return output
-
-
-# MoE Patch 实现 - 基于 green-bit-llm 的思路
-class QuantizedQwen3MoE:
-    """量化友好的 Qwen3 MoE 前向传播实现"""
-
-    @staticmethod
-    def forward(self, hidden_states: torch.Tensor):
-        """参考 green-bit-llm 的 MoE patch 实现"""
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-        hidden_states_flat = hidden_states.view(-1, hidden_dim)
-
-        # 路由计算
-        router_logits, _ = self.gate(hidden_states_flat)
-
-        # 使用传统的专家逐个计算方式，与 GBA 量化兼容
-        routing_weights = torch.nn.functional.softmax(router_logits.float(), dim=-1)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        routing_weights = routing_weights.to(hidden_states.dtype)
-
-        if self.norm_topk_prob:
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-
-        final_hidden_states = torch.zeros_like(hidden_states_flat)
-
-        # 逐token处理，确保与量化kernel兼容
-        for i in range(hidden_states_flat.size(0)):
-            token_input = hidden_states_flat[i:i + 1]
-            token_output = torch.zeros_like(token_input)
-
-            for j in range(self.top_k):
-                expert_idx = selected_experts[i, j].item()
-                expert_weight = routing_weights[i, j].item()
-
-                if expert_weight > 1e-6:
-                    # 这里调用的是独立的专家层，每个都是 GBALinearMethod
-                    expert_output = self.experts[expert_idx](token_input)
-                    token_output += expert_output * expert_weight
-
-            final_hidden_states[i] = token_output[0]
-
-        return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
-
-
-def apply_gba_moe_patches():
-    """应用 GBA 量化友好的 MoE patches"""
-    try:
-        # Qwen3 MoE patch
-        from vllm.model_executor.models.qwen3_moe import Qwen3MoeSparseMoeBlock
-        if not hasattr(Qwen3MoeSparseMoeBlock, '_original_forward'):
-            Qwen3MoeSparseMoeBlock._original_forward = Qwen3MoeSparseMoeBlock.forward
-        Qwen3MoeSparseMoeBlock.forward = QuantizedQwen3MoE.forward
-        logger.info("Applied GBA-compatible Qwen3 MoE patch")
-        return True
-    except ImportError:
-        logger.warning("Qwen3 MoE models not available, skipping patch")
-        return False
-
-
-def restore_gba_moe_patches():
-    """恢复原始的 MoE 前向传播方法"""
-    try:
-        from vllm.model_executor.models.qwen3_moe import Qwen3MoeSparseMoeBlock
-        if hasattr(Qwen3MoeSparseMoeBlock, '_original_forward'):
-            Qwen3MoeSparseMoeBlock.forward = Qwen3MoeSparseMoeBlock._original_forward
-            delattr(Qwen3MoeSparseMoeBlock, '_original_forward')
-            logger.info("Restored original Qwen3 MoE forward method")
-    except ImportError:
-        pass

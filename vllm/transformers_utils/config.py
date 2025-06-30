@@ -218,7 +218,7 @@ def patch_rope_scaling_dict(rope_scaling: dict[str, Any]) -> None:
 
     if "rope_type" not in rope_scaling and "type" in rope_scaling:
         rope_scaling["rope_type"] = rope_scaling["type"]
-        logger.info("Replacing legacy 'type' key with 'rope_type'")
+        logger.debug("Replacing legacy 'type' key with 'rope_type'")
 
     if "rope_type" not in rope_scaling:
         raise ValueError("rope_scaling should have a 'rope_type' key")
@@ -593,57 +593,48 @@ def get_sentence_transformer_tokenizer_config(model: str,
         return encoder_dict
     return None
 
+
 def enhance_config_with_quantization(config, model_path: str):
-    """
-    Enhanced configuration function that detects and applies GBA quantization
 
-    This function should be called during model configuration setup,
-    typically in the get_config() function in config.py
-    """
-    from vllm.model_executor.model_loader.weight_utils import detect_gba_quantization
+    if hasattr(config, '_gba_quantization') and config._gba_quantization:
+        logger.debug("GBA configuration already enhanced, skipping")
+        return config
 
-    config_dict = config.to_dict()
-    is_gba, gba_config = detect_gba_quantization(str(model_path), config_dict)
+    try:
+        from vllm.model_executor.model_loader.weight_utils import detect_gba_quantization
 
-    if is_gba:
-        config_dict["quantization_config"] = gba_config
-        config_dict["quantization"] = "gba"
+        config_dict = config.to_dict()
 
-        # For MoE models, ensure separated architecture
-        if gba_config.get("moe_info", {}).get("type") != "standard":
-            config_dict.update({
-                "_gba_moe_mode": True,
-                "_force_separated_architecture": True,
-            })
-            logger.info("Applied GBA MoE separated architecture mode")
+        if 'quantization_config' not in config_dict or not config_dict.get('quantization'):
+            is_gba, gba_config = detect_gba_quantization(str(model_path), config_dict)
 
-        try:
-            enhanced_config = config.__class__.from_dict(config_dict)
-            # Set additional attributes directly
-            enhanced_config.quantization_config = gba_config
-            enhanced_config._gba_quantization = True
+            if is_gba:
+                try:
+                    config.quantization_config = gba_config
+                    config.quantization = "gba"
+                    config._gba_quantization = True
 
-            if gba_config.get("moe_info"):
-                enhanced_config._gba_moe_mode = True
+                    if gba_config.get("moe_info", {}).get("type") != "standard":
+                        config._gba_moe_mode = True
+                        config._force_separated_architecture = True
 
-            # Log summary
-            log_quantization_summary(enhanced_config, model_path)
+                    return config
 
-            logger.info("✅ Successfully created GBA enhanced configuration")
-            return enhanced_config
-        except Exception as e:
-            logger.warning(f"Failed to create enhanced config: {e}")
-            # Fallback: set attributes directly
-            config.quantization_config = gba_config
+                except Exception as e:
+                    logger.warning(f"Failed to apply GBA config: {e}")
+                    return config
+        else:
             config._gba_quantization = True
+            logger.debug("Using existing quantization configuration")
 
-            if gba_config.get("moe_info"):
-                config._gba_moe_mode = True
+        return config
 
-            logger.info("✅ Applied GBA configuration as fallback")
-            return config
-
-    return config
+    except ImportError as e:
+        logger.warning(f"GBA quantization detection not available: {e}")
+        return config
+    except Exception as e:
+        logger.debug(f"Config enhancement failed: {e}")
+        return config
 
 def maybe_register_config_serialize_by_value() -> None:
     """Try to register HF model configuration class to serialize by value

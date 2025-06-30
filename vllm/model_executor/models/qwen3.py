@@ -46,6 +46,7 @@ from .interfaces import SupportsLoRA, SupportsPP
 from .qwen2 import Qwen2Model
 from .utils import AutoWeightsLoader, PPMissingLayer, maybe_prefix
 
+
 logger = init_logger(__name__)
 
 
@@ -100,7 +101,6 @@ class Qwen3MLPSeparated(nn.Module):
     ) -> None:
         super().__init__()
 
-        # 创建分离的投影层
         self.gate_proj = ColumnParallelLinear(
             hidden_size,
             intermediate_size,
@@ -127,11 +127,9 @@ class Qwen3MLPSeparated(nn.Module):
                              "Only silu is supported for now.")
 
     def forward(self, x):
-        # 分离的前向传播
         gate_output, _ = self.gate_proj(x)
         up_output, _ = self.up_proj(x)
 
-        # 手动实现 SiLU 激活和元素乘法
         gate_output = torch.nn.functional.silu(gate_output)
         intermediate = gate_output * up_output
 
@@ -180,9 +178,9 @@ class Qwen3Attention(nn.Module):
 
         self.use_fused_qkv = use_fused_qkv
 
-        # 根据是否使用融合QKV决定创建哪种投影层
+        # Decide which projection layer to create based on whether to use fused QKV
         if self.use_fused_qkv:
-            # 创建融合的QKV投影
+            # Create a fused QKV projection
             self.qkv_proj = QKVParallelLinear(
                 hidden_size,
                 self.head_dim,
@@ -193,7 +191,7 @@ class Qwen3Attention(nn.Module):
                 prefix=f"{prefix}.qkv_proj",
             )
         else:
-            # 创建分离的Q/K/V投影
+            # Create separate Q/K/V projections
             self.q_proj = ColumnParallelLinear(
                 hidden_size,
                 self.total_num_heads * self.head_dim,
@@ -248,11 +246,10 @@ class Qwen3Attention(nn.Module):
             hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         if self.use_fused_qkv:
-            # 融合QKV前向传播
+            # Fused QKV forward propagation
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         else:
-            # 分离QKV前向传播
             q, _ = self.q_proj(hidden_states)
             k, _ = self.k_proj(hidden_states)
             v, _ = self.v_proj(hidden_states)
@@ -315,7 +312,6 @@ class Qwen3DecoderLayer(nn.Module):
             use_fused_qkv=use_fused_qkv,
         )
 
-        # 根据是否使用融合MLP决定创建哪种MLP
         if use_fused_gate_up:
             self.mlp = Qwen3MLP(
                 hidden_size=self.hidden_size,
@@ -325,7 +321,6 @@ class Qwen3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
             )
         else:
-            # 使用分离版本的MLP
             self.mlp = Qwen3MLPSeparated(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -400,39 +395,80 @@ class Qwen3Model(Qwen2Model):
                          decoder_layer_type=create_decoder_layer)
 
     def _detect_and_configure_weight_format(self, model_path: str) -> tuple[bool, bool]:
-        """Detect weight format and configure packed_modules_mapping"""
+        cache_key = str(model_path).replace("/", "--")
+        if hasattr(self.__class__, '_weight_format_cache'):
+            if cache_key in self.__class__._weight_format_cache:
+                cached_result = self.__class__._weight_format_cache[cache_key]
+                logger.debug(f"Using cached weight format: {cached_result}")
+                use_fused_qkv, use_fused_gate_up = cached_result
+
+                new_mapping = {}
+                if use_fused_qkv:
+                    new_mapping["qkv_proj"] = ["q_proj", "k_proj", "v_proj"]
+                if use_fused_gate_up:
+                    new_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
+                self.__class__.packed_modules_mapping = new_mapping
+
+                return use_fused_qkv, use_fused_gate_up
+        else:
+            self.__class__._weight_format_cache = {}
+
         try:
             from safetensors import safe_open
             from huggingface_hub import snapshot_download
             import os
 
-            local_path = snapshot_download(model_path, allow_patterns="*.safetensors")
+            # Get the local model path
+            if os.path.exists(model_path):
+                local_path = model_path
+            else:
+                local_path = snapshot_download(model_path, allow_patterns="*.safetensors")
 
-            # Check the keys in the weights file
+            # Collect weight key names - Key fix: only read key names, not data
             weight_keys = set()
-            for root, dirs, files in os.walk(local_path):
-                for file in files:
-                    if file.endswith('.safetensors'):
+
+            # Prioritize searching index files
+            index_file = os.path.join(local_path, "model.safetensors.index.json")
+            if os.path.exists(index_file):
+                logger.debug("Found index file, using it for format detection")
+                import json
+                with open(index_file, 'r') as f:
+                    index_data = json.load(f)
+                    weight_map = index_data.get("weight_map", {})
+                    weight_keys.update(weight_map.keys())
+            else:
+                # If there is no index file, read the key name of the safetensors file directly
+                for root, dirs, files in os.walk(local_path):
+                    safetensors_files = [f for f in files if f.endswith('.safetensors')]
+                    for file in safetensors_files[:2]:
                         safetensors_file = os.path.join(root, file)
                         try:
                             with safe_open(safetensors_file, framework="pt") as f:
-                                weight_keys.update(f.keys())
+                                file_keys = list(f.keys())
+                                weight_keys.update(file_keys)
+
+                                if any("qkv_proj.qweight" in key for key in weight_keys) or \
+                                        any("q_proj.qweight" in key for key in weight_keys):
+                                    break
                         except Exception as e:
                             logger.warning(f"Failed to read {file}: {e}")
 
             has_fused_qkv = any("qkv_proj.qweight" in key for key in weight_keys)
-            has_separated_qkv = (any("q_proj.qweight" in key for key in weight_keys) and
-                                 any("k_proj.qweight" in key for key in weight_keys) and
-                                 any("v_proj.qweight" in key for key in weight_keys))
+            has_separated_qkv = (
+                    any("q_proj.qweight" in key for key in weight_keys) and
+                    any("k_proj.qweight" in key for key in weight_keys) and
+                    any("v_proj.qweight" in key for key in weight_keys)
+            )
 
             has_fused_gate_up = any("gate_up_proj.qweight" in key for key in weight_keys)
-            has_separated_gate_up = (any("gate_proj.qweight" in key for key in weight_keys) and
-                                     any("up_proj.qweight" in key for key in weight_keys))
+            has_separated_gate_up = (
+                    any("gate_proj.qweight" in key for key in weight_keys) and
+                    any("up_proj.qweight" in key for key in weight_keys)
+            )
 
             use_fused_qkv = has_fused_qkv and not has_separated_qkv
             use_fused_gate_up = has_fused_gate_up and not has_separated_gate_up
 
-            # Setting packed_modules_mapping
             new_mapping = {}
             if use_fused_qkv:
                 new_mapping["qkv_proj"] = ["q_proj", "k_proj", "v_proj"]
@@ -441,14 +477,18 @@ class Qwen3Model(Qwen2Model):
 
             self.__class__.packed_modules_mapping = new_mapping
 
+            self.__class__._weight_format_cache[cache_key] = (use_fused_qkv, use_fused_gate_up)
+
             logger.debug(
-                f"Weight format: fused_qkv={use_fused_qkv}, fused_gate_up={use_fused_gate_up}, mapping={new_mapping}")
+                f"Weight format detection complete: fused_qkv={use_fused_qkv}, "
+                f"fused_gate_up={use_fused_gate_up}, mapping={new_mapping}")
 
             return use_fused_qkv, use_fused_gate_up
 
         except Exception as e:
-            logger.error(f"权重格式检测失败: {e}")
+            logger.error(f"Weight format detection failed: {e}")
             self.__class__.packed_modules_mapping = {}
+            self.__class__._weight_format_cache[cache_key] = (False, False)
             return False, False
 
 class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):

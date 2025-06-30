@@ -49,8 +49,6 @@ except ImportError:
         "SafeTensorsFileLoader")
     SingleGroup = fastsafetensors.placeholder_attr("SingleGroup")
 
-from vllm.model_executor.layers.quantization.gba_moe_support import detect_moe_model_type
-
 logger = init_logger(__name__)
 
 # use system-level temp directory for file locks, so that multiple users
@@ -148,26 +146,36 @@ def convert_bin_to_safetensor_file(
 def get_quant_config(model_config: ModelConfig,
                      load_config: LoadConfig) -> QuantizationConfig:
 
-    if hasattr(model_config, 'quantization') and model_config.quantization == "gba":
-        logger.info("Detected GBA quantization from model config")
+    if (hasattr(model_config, 'quantization') and
+            model_config.quantization == "gba" and
+            hasattr(model_config.hf_config, '_gba_quantization') and
+            model_config.hf_config._gba_quantization):
 
-        # Try to get GBA config from hf_config
+        if hasattr(model_config.hf_config, 'quantization_config'):
+            from vllm.model_executor.layers.quantization.gba import GBAConfig
+            return GBAConfig.from_config(model_config.hf_config.quantization_config)
+
+    if (hasattr(model_config,
+                'quantization') and model_config.quantization == "gba") or model_config.quantization is None:
+
+        if (hasattr(model_config.hf_config, 'quantization_config') and
+                isinstance(model_config.hf_config.quantization_config, dict) and
+                model_config.hf_config.quantization_config.get('quant_method') == 'gba'):
+
+            from vllm.model_executor.layers.quantization.gba import GBAConfig
+            return GBAConfig.from_config(model_config.hf_config.quantization_config)
+
         hf_config_dict = model_config.hf_config.to_dict() if hasattr(model_config, 'hf_config') else {}
         is_gba, gba_config_dict = detect_gba_quantization(str(model_config.model), hf_config_dict)
 
         if is_gba:
             from vllm.model_executor.layers.quantization.gba import GBAConfig
-            return GBAConfig.from_config(gba_config_dict)
-
-    # Try automatic GBA detection if not explicitly set
-    if model_config.quantization is None:
-        hf_config_dict = model_config.hf_config.to_dict() if hasattr(model_config, 'hf_config') else {}
-        is_gba, gba_config_dict = detect_gba_quantization(str(model_config.model), hf_config_dict)
-
-        if is_gba:
-            from vllm.model_executor.layers.quantization.gba import GBAConfig
-            # Update model config to reflect GBA quantization
             model_config.quantization = "gba"
+
+            if hasattr(model_config, 'hf_config'):
+                model_config.hf_config._gba_quantization = True
+                model_config.hf_config.quantization_config = gba_config_dict
+
             return GBAConfig.from_config(gba_config_dict)
 
     quant_cls = get_quantization_config(model_config.quantization)
@@ -843,57 +851,44 @@ def load_gba_strategy_config(model_path: str) -> Optional[Dict[str, Any]]:
 
 
 def detect_gba_quantization(model_path: str, config: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
-    """
-    Detect if model uses GBA quantization and return configuration
-    Integration point for vLLM's weight loading system
-    """
+    cache_key = f"gba_detection_{hash(model_path)}"
+    if hasattr(detect_gba_quantization, '_cache') and cache_key in detect_gba_quantization._cache:
+        logger.debug(f"Using cached GBA detection result for {model_path}")
+        return detect_gba_quantization._cache[cache_key]
 
-    logger.info(f"=== Checking for GBA quantization: {model_path} ===")
+    if not hasattr(detect_gba_quantization, '_cache'):
+        detect_gba_quantization._cache = {}
 
-    # Check model name patterns
     model_name = str(model_path)
     is_gba_name = ("GreenBitAI" in model_name or
                    "greenbit" in model_name.lower() or
                    "layer-mix" in model_name or
                    "channel-mix" in model_name)
 
-    def get_model_path(path_or_hf_repo: str, token=None) -> Path:
-        """
-        Ensures the model is available locally. If the path does not exist locally,
-        it is downloaded from the Hugging Face Hub.
-        """
-        model_path = Path(path_or_hf_repo)
-        if not model_path.exists():
-            model_path = Path(
-                snapshot_download(
-                    repo_id=path_or_hf_repo,
-                    allow_patterns=[
-                        "*.json",
-                        "*.safetensors",
-                        "*.py",
-                        "tokenizer.model",
-                        "*.tiktoken",
-                        "*.txt",
-                    ],
-                    token=token
-                )
-            )
-        return model_path
-
-    # 使用改进的路径获取逻辑
     has_strategy_files = False
     strategy_config = None
-    try:
-        local_model_path = get_model_path(model_path)
-        if local_model_path.exists():
-            strategy_config = load_gba_strategy_config(str(local_model_path))
-            if strategy_config:
-                has_strategy_files = True
-                logger.info(f"Loaded strategy config from {local_model_path}")
-    except Exception as e:
-        logger.warning(f"Failed to get local model path for {model_path}: {e}")
 
-    # Check for quantization_config in hf config
+    try:
+        if os.path.exists(model_path):
+            local_path = model_path
+        else:
+            from huggingface_hub import snapshot_download
+            local_path = snapshot_download(
+                model_path,
+                allow_patterns=["*.json", "*.txt", "*.md", "*.py"],
+                ignore_patterns=["*.safetensors", "*.bin", "*.pt", "*.pth"]
+            )
+
+        logger.debug(f"Using model path for GBA detection: {local_path}")
+
+        strategy_config = load_gba_strategy_config(str(local_path))
+        if strategy_config:
+            has_strategy_files = True
+            logger.debug(f"Loaded strategy config from {local_path}")
+
+    except Exception as e:
+        logger.warning(f"Failed to get model path for GBA detection {model_path}: {e}")
+
     has_quant_config = "quantization_config" in config
     if has_quant_config:
         quant_config = config["quantization_config"]
@@ -916,7 +911,7 @@ def detect_gba_quantization(model_path: str, config: Dict[str, Any]) -> Tuple[bo
             "_name_or_path": model_name
         }
 
-        # Parse bit width and group size from model name
+        import re
         bpw_match = re.search(r'bpw-(\d+\.?\d*)', model_name)
         if bpw_match:
             gba_config["weight_bits"] = int(float(bpw_match.group(1)))
@@ -925,29 +920,41 @@ def detect_gba_quantization(model_path: str, config: Dict[str, Any]) -> Tuple[bo
         if groupsize_match:
             gba_config["group_size"] = int(groupsize_match.group(1))
 
-        # Use existing quantization_config if available
         if has_quant_config and is_gba_config:
             quant_config = config["quantization_config"]
             gba_config.update(quant_config)
 
-        # Add strategy config if available
         if strategy_config:
             gba_config["strategy"] = strategy_config
-            logger.info("Successfully added strategy config to GBA config")
+            logger.debug("Successfully added strategy config to GBA config")
 
-        # Add MoE info
-        class MockConfig:
-            def __init__(self, **kwargs):
-                for k, v in kwargs.items():
-                    setattr(self, k, v)
+        moe_info = {
+            'type': 'standard',
+            'needs_patch': False,
+            'experts_count': 0,
+            'has_shared_experts': False,
+            'routed_experts': 0,
+            'shared_experts': 0,
+        }
 
-        mock_config = MockConfig(**config)
-        moe_info = detect_moe_model_type(mock_config)
+        if 'qwen3' in model_name.lower() or 'qwen-3' in model_name.lower():
+            if 'A3B' in model_name or 'moe' in model_name.lower():
+                moe_info.update({
+                    'type': 'qwen3_moe',
+                    'experts_count': 8,
+                    'routed_experts': 8,
+                })
+
         gba_config["moe_info"] = moe_info
+
+        result = (True, gba_config)
+        detect_gba_quantization._cache[cache_key] = result
 
         logger.info(
             f"Detected GBA quantization for {model_name}: bits={gba_config['weight_bits']}, "
             f"use_mbw={gba_config['use_mbw']}, moe_type={moe_info['type']}")
-        return True, gba_config
+        return result
 
-    return False, {}
+    result = (False, {})
+    detect_gba_quantization._cache[cache_key] = result
+    return result
