@@ -213,12 +213,15 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         """
         GBA-compatible forward pass using ONLY separated experts
         Token-by-token processing for maximum quantization compatibility
+        PERFORMANCE NOTE:
+            self.experts[expert_idx](expert_inputs) 最终会调用到 ops.gba_linear_forward 这个 CUDA kernel，
+            这是真正的性能瓶颈。Python 层面已经没有优化空间了, 需要在 CUDA 算子层面优化
         """
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # Router computation (保持不变)
+        # Router computation
         router_logits, _ = self.gate(hidden_states)
         routing_weights = torch.nn.functional.softmax(router_logits, dim=-1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
@@ -228,50 +231,30 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         routing_weights = routing_weights.to(hidden_states.dtype)
 
-        expert_batch_inputs = {}
-        expert_batch_info = {}
+        final_hidden_states = torch.empty_like(hidden_states)
+        final_hidden_states.zero_()
 
-        # 第一遍：收集所有expert的输入
+        expert_assignments = {}
         for expert_idx in range(self.num_experts):
-            expert_mask = (selected_experts == expert_idx)
+            mask = (selected_experts == expert_idx)
+            if mask.any():
+                token_indices, expert_positions = torch.where(mask)
+                if len(token_indices) > 0:
+                    expert_assignments[expert_idx] = {
+                        'token_indices': token_indices,
+                        'expert_positions': expert_positions,
+                        'inputs': hidden_states[token_indices],
+                        'weights': routing_weights[token_indices, expert_positions]
+                    }
 
-            if not expert_mask.any():
-                continue
-
-            token_indices, expert_positions = torch.where(expert_mask)
-
-            if len(token_indices) == 0:
-                continue
-
-            expert_inputs = hidden_states[token_indices]
-            expert_weights = routing_weights[token_indices, expert_positions]
-
-            # 批量存储该expert的所有输入
-            expert_batch_inputs[expert_idx] = expert_inputs  # [N, hidden_dim]
-            expert_batch_info[expert_idx] = {
-                'token_indices': token_indices,
-                'expert_positions': expert_positions,
-                'weights': expert_weights
-            }
-
-        if not expert_batch_inputs:
+        if not expert_assignments:
             return torch.zeros_like(hidden_states).view(orig_shape)
 
-        final_hidden_states = torch.zeros_like(hidden_states)
+        for expert_idx, assignment in expert_assignments.items():
+            expert_outputs = self.experts[expert_idx](assignment['inputs'])
 
-        # 第二遍：批量调用每个expert（大幅减少调用次数）
-        for expert_idx, batch_inputs in expert_batch_inputs.items():
-            info = expert_batch_info[expert_idx]
-
-            # 关键：一次性处理该expert的所有输入（而非逐token）
-            # 输入大小从 [1, hidden_dim] 变为 [N, hidden_dim]
-            batch_outputs = self.experts[expert_idx](batch_inputs)  # 单次GBA调用处理N个token
-
-            # 应用权重并累加到结果
-            weighted_outputs = batch_outputs * info['weights'].unsqueeze(-1)
-
-            # 分发回原始位置
-            final_hidden_states.index_add_(0, info['token_indices'], weighted_outputs)
+            weighted_outputs = expert_outputs.mul_(assignment['weights'].unsqueeze(-1))
+            final_hidden_states.index_add_(0, assignment['token_indices'], weighted_outputs)
 
         return final_hidden_states.view(orig_shape)
 

@@ -377,14 +377,12 @@ class Qwen2Model(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        # 获取当前模型的 packed_modules_mapping
         model_packed_mapping = getattr(self, 'packed_modules_mapping', {})
 
-        # 如果 packed_modules_mapping 为空，说明使用分离层，不进行参数映射
         use_stacked_mapping = bool(model_packed_mapping)
 
         if not use_stacked_mapping:
-            logger.info("Separated layer architecture detected, disabling parameter name mapping")
+            logger.debug("Separated layer architecture detected, disabling parameter name mapping")
 
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: set[str] = set()

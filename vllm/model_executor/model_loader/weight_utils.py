@@ -815,7 +815,6 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
     # If there were no matches, return the untouched param name
     return name
 
-
 def load_gba_strategy_config(model_path: str) -> Optional[Dict[str, Any]]:
     """
     Load GBA quantization strategy configuration from model directory.
@@ -851,110 +850,142 @@ def load_gba_strategy_config(model_path: str) -> Optional[Dict[str, Any]]:
 
 
 def detect_gba_quantization(model_path: str, config: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
-    cache_key = f"gba_detection_{hash(model_path)}"
-    if hasattr(detect_gba_quantization, '_cache') and cache_key in detect_gba_quantization._cache:
-        logger.debug(f"Using cached GBA detection result for {model_path}")
-        return detect_gba_quantization._cache[cache_key]
+    """
+    Optimized GBA quantization detection with improved caching and error handling
+    """
+    # Create stable cache key using content hash
+    cache_content = f"{model_path}_{json.dumps(config, sort_keys=True)}"
+    cache_key = f"gba_{hashlib.sha256(cache_content.encode()).hexdigest()[:16]}"
 
+    # Check cache
     if not hasattr(detect_gba_quantization, '_cache'):
         detect_gba_quantization._cache = {}
 
+    if cache_key in detect_gba_quantization._cache:
+        logger.debug(f"Using cached GBA detection result for {model_path}")
+        return detect_gba_quantization._cache[cache_key]
+
+    # Detection logic
+    result = _perform_gba_detection(model_path, config)
+
+    # Cache result
+    detect_gba_quantization._cache[cache_key] = result
+    return result
+
+
+def _perform_gba_detection(model_path: str, config: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    """Perform actual GBA detection logic"""
     model_name = str(model_path)
-    is_gba_name = ("GreenBitAI" in model_name or
-                   "greenbit" in model_name.lower() or
-                   "layer-mix" in model_name or
-                   "channel-mix" in model_name)
 
-    has_strategy_files = False
-    strategy_config = None
+    # Check 1: Model name patterns
+    is_gba_name = any(pattern in model_name.lower() for pattern in [
+        "greenbitai", "greenbit", "layer-mix", "channel-mix"
+    ])
 
-    try:
-        if os.path.exists(model_path):
-            local_path = model_path
-        else:
-            from huggingface_hub import snapshot_download
-            local_path = snapshot_download(
-                model_path,
-                allow_patterns=["*.json", "*.txt", "*.md", "*.py"],
-                ignore_patterns=["*.safetensors", "*.bin", "*.pt", "*.pth"]
-            )
-
-        logger.debug(f"Using model path for GBA detection: {local_path}")
-
-        strategy_config = load_gba_strategy_config(str(local_path))
-        if strategy_config:
-            has_strategy_files = True
-            logger.debug(f"Loaded strategy config from {local_path}")
-
-    except Exception as e:
-        logger.warning(f"Failed to get model path for GBA detection {model_path}: {e}")
-
+    # Check 2: Existing quantization config
     has_quant_config = "quantization_config" in config
+    is_gba_config = False
     if has_quant_config:
         quant_config = config["quantization_config"]
         is_gba_config = (
                 isinstance(quant_config, dict) and
                 quant_config.get("quantization_method") == "gba"
         )
-    else:
-        is_gba_config = False
 
+    # Check 3: Strategy files
+    strategy_config = None
+    try:
+        strategy_config = _load_strategy_config_safe(model_path)
+    except Exception as e:
+        logger.debug(f"Failed to load strategy config: {e}")
+
+    has_strategy_files = strategy_config is not None
+
+    # Determine if this is a GBA model
     is_gba_model = is_gba_name or has_strategy_files or is_gba_config
 
-    if is_gba_model:
-        gba_config = {
-            "quantization_method": "gba",
-            "quant_method": "gba",
-            "weight_bits": 4,
-            "group_size": 128,
-            "use_mbw": "channel-mix" in model_name,
-            "_name_or_path": model_name
-        }
+    if not is_gba_model:
+        return False, {}
 
-        import re
-        bpw_match = re.search(r'bpw-(\d+\.?\d*)', model_name)
-        if bpw_match:
-            gba_config["weight_bits"] = int(float(bpw_match.group(1)))
+    # Build GBA configuration
+    gba_config = _build_gba_config(model_name, config, strategy_config)
 
-        groupsize_match = re.search(r'groupsize(\d+)', model_name)
-        if groupsize_match:
-            gba_config["group_size"] = int(groupsize_match.group(1))
+    logger.info(
+        f"Detected GBA quantization for {model_name}: "
+        f"bits={gba_config['weight_bits']}, use_mbw={gba_config['use_mbw']}, "
+        f"moe_type={gba_config['moe_info']['type']}"
+    )
 
-        if has_quant_config and is_gba_config:
-            quant_config = config["quantization_config"]
-            gba_config.update(quant_config)
+    return True, gba_config
 
-        if strategy_config:
-            gba_config["strategy"] = strategy_config
-            logger.debug("Successfully added strategy config to GBA config")
 
-        moe_info = {
-            'type': 'standard',
-            'needs_patch': False,
-            'experts_count': 0,
-            'has_shared_experts': False,
-            'routed_experts': 0,
-            'shared_experts': 0,
-        }
+def _load_strategy_config_safe(model_path: str) -> Optional[Dict[str, Any]]:
+    """Safely load strategy configuration"""
+    try:
+        if os.path.exists(model_path):
+            local_path = model_path
+        else:
+            local_path = snapshot_download(
+                model_path,
+                allow_patterns=["*.json", "*.txt", "*.md", "*.py"],
+                ignore_patterns=["*.safetensors", "*.bin", "*.pt", "*.pth"]
+            )
 
-        if 'qwen3' in model_name.lower() or 'qwen-3' in model_name.lower():
-            if 'A3B' in model_name or 'moe' in model_name.lower():
-                moe_info.update({
-                    'type': 'qwen3_moe',
-                    'experts_count': 8,
-                    'routed_experts': 8,
-                })
+        return load_gba_strategy_config(str(local_path))
+    except Exception:
+        return None
 
-        gba_config["moe_info"] = moe_info
 
-        result = (True, gba_config)
-        detect_gba_quantization._cache[cache_key] = result
+def _build_gba_config(model_name: str, config: Dict[str, Any], strategy_config: Optional[Dict]) -> Dict[str, Any]:
+    """Build GBA configuration from detected components"""
+    gba_config = {
+        "quantization_method": "gba",
+        "quant_method": "gba",
+        "weight_bits": 4,
+        "group_size": 128,
+        "use_mbw": "channel-mix" in model_name,
+        "_name_or_path": model_name
+    }
 
-        logger.info(
-            f"Detected GBA quantization for {model_name}: bits={gba_config['weight_bits']}, "
-            f"use_mbw={gba_config['use_mbw']}, moe_type={moe_info['type']}")
-        return result
+    # Extract parameters from model name
+    if bpw_match := re.search(r'bpw-(\d+\.?\d*)', model_name):
+        gba_config["weight_bits"] = int(float(bpw_match.group(1)))
 
-    result = (False, {})
-    detect_gba_quantization._cache[cache_key] = result
-    return result
+    if groupsize_match := re.search(r'groupsize(\d+)', model_name):
+        gba_config["group_size"] = int(groupsize_match.group(1))
+
+    # Merge existing quantization config
+    if "quantization_config" in config and isinstance(config["quantization_config"], dict):
+        gba_config.update(config["quantization_config"])
+
+    # Add strategy config
+    if strategy_config:
+        gba_config["strategy"] = strategy_config
+
+    # Add MoE info
+    gba_config["moe_info"] = _detect_moe_info(model_name)
+
+    return gba_config
+
+
+def _detect_moe_info(model_name: str) -> Dict[str, Any]:
+    """Detect MoE configuration from model name"""
+    moe_info = {
+        'type': 'standard',
+        'needs_patch': False,
+        'experts_count': 0,
+        'has_shared_experts': False,
+        'routed_experts': 0,
+        'shared_experts': 0,
+    }
+
+    # Detect specific MoE models
+    if any(pattern in model_name.lower() for pattern in ['qwen3', 'qwen-3']):
+        if any(pattern in model_name for pattern in ['A3B', 'moe']):
+            moe_info.update({
+                'type': 'qwen3_moe',
+                'experts_count': 8,
+                'routed_experts': 8,
+            })
+
+    return moe_info
