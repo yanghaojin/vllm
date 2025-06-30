@@ -218,7 +218,7 @@ def patch_rope_scaling_dict(rope_scaling: dict[str, Any]) -> None:
 
     if "rope_type" not in rope_scaling and "type" in rope_scaling:
         rope_scaling["rope_type"] = rope_scaling["type"]
-        logger.info("Replacing legacy 'type' key with 'rope_type'")
+        logger.debug("Replacing legacy 'type' key with 'rope_type'")
 
     if "rope_type" not in rope_scaling:
         raise ValueError("rope_scaling should have a 'rope_type' key")
@@ -383,7 +383,6 @@ def get_config(
     if trust_remote_code:
         maybe_register_config_serialize_by_value()
 
-    # 新增：尝试增强配置以支持 GBA 量化
     try:
         config = enhance_config_with_quantization(config, str(model))
     except Exception as e:
@@ -594,34 +593,48 @@ def get_sentence_transformer_tokenizer_config(model: str,
         return encoder_dict
     return None
 
+
 def enhance_config_with_quantization(config, model_path: str):
-    """Enhance model configuration with quantization information."""
-    from vllm.model_executor.model_loader.weight_utils import detect_gba_quantization
 
-    config_dict = config.to_dict()
-    is_gba, gba_config = detect_gba_quantization(str(model_path), config_dict)
+    if hasattr(config, '_gba_quantization') and config._gba_quantization:
+        logger.debug("GBA configuration already enhanced, skipping")
+        return config
 
-    if is_gba:
-        # 直接在 config_dict 中设置 quantization_config
-        config_dict["quantization_config"] = gba_config
-        config_dict["quantization"] = "gba"
+    try:
+        from vllm.model_executor.model_loader.weight_utils import detect_gba_quantization
 
-        # 重新创建配置对象
-        try:
-            enhanced_config = config.__class__.from_dict(config_dict)
-            # logger.info(
-            #     f"Enhanced config with GBA quantization: "
-            #     f"bits={gba_config.get('weight_bits', 4)}, "
-            #     f"group_size={gba_config.get('group_size', 128)}")
-            return enhanced_config
-        except Exception as e:
-            logger.warning(f"Failed to create enhanced config: {e}, using original config")
-            # 直接设置属性作为备选方案
-            config.quantization_config = gba_config
-            logger.info(f"Set quantization_config attribute directly")
-            return config
+        config_dict = config.to_dict()
 
-    return config
+        if 'quantization_config' not in config_dict or not config_dict.get('quantization'):
+            is_gba, gba_config = detect_gba_quantization(str(model_path), config_dict)
+
+            if is_gba:
+                try:
+                    config.quantization_config = gba_config
+                    config.quantization = "gba"
+                    config._gba_quantization = True
+
+                    if gba_config.get("moe_info", {}).get("type") != "standard":
+                        config._gba_moe_mode = True
+                        config._force_separated_architecture = True
+
+                    return config
+
+                except Exception as e:
+                    logger.warning(f"Failed to apply GBA config: {e}")
+                    return config
+        else:
+            config._gba_quantization = True
+            logger.debug("Using existing quantization configuration")
+
+        return config
+
+    except ImportError as e:
+        logger.warning(f"GBA quantization detection not available: {e}")
+        return config
+    except Exception as e:
+        logger.debug(f"Config enhancement failed: {e}")
+        return config
 
 def maybe_register_config_serialize_by_value() -> None:
     """Try to register HF model configuration class to serialize by value

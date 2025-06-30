@@ -384,7 +384,7 @@ class Qwen2Model(nn.Module):
         use_stacked_mapping = bool(model_packed_mapping)
 
         if not use_stacked_mapping:
-            logger.info("检测到分离层架构，禁用参数名映射")
+            logger.info("Separated layer architecture detected, disabling parameter name mapping")
 
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: set[str] = set()
