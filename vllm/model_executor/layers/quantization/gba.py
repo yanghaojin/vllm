@@ -131,23 +131,18 @@ class GBALinearMethod(LinearMethodBase):
             params_dtype: torch.dtype,
             **extra_weight_attrs,
     ) -> None:
-        """Create GBA quantized weight parameters"""
+        """Create GBA quantized weight parameters with TP support"""
 
         output_size_per_partition = sum(output_partition_sizes)
-
         gba_weight_loader = self._get_gba_weight_loader()
-
-        # layer specific config
         layer_prefix = extra_weight_attrs.get("prefix", "")
 
         is_moe_expert = 'mlp.experts.' in layer_prefix and any(
             proj in layer_prefix for proj in ['gate_proj', 'up_proj', 'down_proj'])
-
         is_moe_gate = (layer_prefix.endswith('mlp.gate') or
                        'mlp.gate.' in layer_prefix) and 'experts' not in layer_prefix
 
         layer_config = self._get_layer_config(layer_prefix)
-
         weight_bits = layer_config.get("weight_bits", self.quant_config.weight_bits)
         group_size = layer_config.get("group_size", self.quant_config.group_size)
 
@@ -157,14 +152,11 @@ class GBALinearMethod(LinearMethodBase):
         num_groups = input_size_per_partition // group_size
 
         if not self.quant_config.use_mbw:
-            # Standard quantization mode
             packed_rows = input_size_per_partition * weight_bits // 32
             qweight_shape = (packed_rows, output_size_per_partition)
         else:
-            # Mixed bit-width mode
             qweight_shape = (input_size_per_partition // 32, output_size_per_partition)
 
-        # Create quantization scales and zero points
         scale_zero_shape = (num_groups, output_size_per_partition)
 
         # Create quantized weights
@@ -201,7 +193,7 @@ class GBALinearMethod(LinearMethodBase):
             "weight_loader": gba_weight_loader
         })
 
-        # Create permutation indices
+        # 🔧 q_perm: 确保大小正确对应 input_size_per_partition
         q_perm = torch.nn.Parameter(
             torch.empty(input_size_per_partition, dtype=torch.int16, device="cuda"),
             requires_grad=False,
@@ -213,6 +205,7 @@ class GBALinearMethod(LinearMethodBase):
             "weight_loader": gba_weight_loader
         })
 
+        # 🔧 channel_scale: 确保大小正确对应 input_size_per_partition
         channel_scale = torch.nn.Parameter(
             torch.ones((1, 1, input_size_per_partition), dtype=params_dtype, device="cuda"),
             requires_grad=False,
@@ -227,7 +220,7 @@ class GBALinearMethod(LinearMethodBase):
 
         # Mixed bit-width mode requires additional parameters
         if self.quant_config.use_mbw:
-            # Group information
+            # 🔧 q_groups: 也可能需要按 TP 分割
             q_groups = torch.nn.Parameter(
                 torch.empty(num_groups * 2, dtype=torch.int16, device="cuda"),
                 requires_grad=False,
@@ -240,11 +233,10 @@ class GBALinearMethod(LinearMethodBase):
             })
             layer.register_parameter("q_groups", q_groups)
 
-        # Group mapping and row information (created in prepare_weights)
+        # Register buffers and parameters
         layer.register_buffer("q_group_map", torch.empty(0, dtype=torch.int32))
         layer.register_buffer("rows_info", torch.empty(0, dtype=torch.int32))
 
-        # Register all parameters
         layer.register_parameter("qweight", qweight)
         layer.register_parameter("scales", scales)
         layer.register_parameter("zeros", zeros)
@@ -255,10 +247,8 @@ class GBALinearMethod(LinearMethodBase):
         layer.output_size_per_partition = output_size_per_partition
         layer.group_size = group_size
         layer.weight_bits = weight_bits
-
         layer.is_moe_expert = is_moe_expert
         layer.is_moe_gate = is_moe_gate
-
         layer._gba_weights_initialized = True
 
     def _get_gba_weight_loader(self):
@@ -271,6 +261,8 @@ class GBALinearMethod(LinearMethodBase):
         return gba_weight_loader_wrapper
 
     def _infer_param_name(self, param: torch.nn.Parameter, shard_id=None) -> str:
+        """Improved parameter name inference for GBA"""
+
         if hasattr(param, '_param_name'):
             return param._param_name
 
@@ -278,26 +270,29 @@ class GBALinearMethod(LinearMethodBase):
         param_dtype = param.dtype
         param_dim = param.dim()
 
-        # Use parameter properties to infer name instead of counter
+        # Use parameter properties for reliable identification
         if param_dtype == torch.int32 and param_dim == 2:
             return "qweight"
         elif param_dtype == torch.int16:
             if param_dim == 1:
-                return "q_perm"
+                # Distinguish between q_perm and q_groups by size
+                if param_shape[0] % 2 == 0:
+                    return "q_groups"  # Usually even numbers for group info
+                else:
+                    return "q_perm"  # Usually corresponds to input features
             else:
                 return "q_groups"
         elif param_dim == 3 and param_shape[0] == 1 and param_shape[1] == 1:
             return "channel_scale"
         elif param_dtype in [torch.float16, torch.bfloat16, torch.float32] and param_dim == 2:
-            # Use parameter memory address hash to determine scales vs zeros
-            # This is more reliable than a counter
-            param_id = id(param)
+            # Use parameter address to distinguish scales vs zeros consistently
+            param_id = hash(str(param.data.data_ptr()))  # More stable than id()
             if param_id % 2 == 0:
                 return "scales"
             else:
                 return "zeros"
 
-        return f"unknown_{param_dim}d_{param_dtype}"
+        return f"unknown_{param_dim}d_{param_dtype}_{param_shape}"
 
     def _gba_weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor, param_name: str) -> None:
         """GBA quantized weight loader implementation with debugging"""
@@ -317,14 +312,18 @@ class GBALinearMethod(LinearMethodBase):
                 return converted
             return tensor
 
+        # 在 gba.py 的 ensure_shape 函数中添加完整的 GBA tensor parallel 支持
         def ensure_shape(tensor: torch.Tensor, target_shape: torch.Size, param_name: str) -> torch.Tensor:
+            """Corrected ensure_shape with proper GBA tensor parallel support"""
+
             if tensor.shape == target_shape:
                 return tensor
 
             if tensor.numel() == target_shape.numel():
+                logger.debug(f"Reshaping {param_name}: {tensor.shape} -> {target_shape}")
                 reshaped = tensor.view(target_shape)
 
-                # check if reshape causing problem
+                # Check for numerical stability in scale parameters
                 if 'scale' in param_name.lower():
                     after_reshape_invalid = torch.any(reshaped <= 0)
                     before_reshape_invalid = torch.any(tensor <= 0)
@@ -333,38 +332,136 @@ class GBALinearMethod(LinearMethodBase):
 
                 return reshaped
 
-            if param_name in ["qweight", "scales", "zeros"] and len(tensor.shape) == 2 and len(target_shape) == 2:
+            # Get tensor parallel info
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+
+            logger.debug(
+                f"Attempting TP split for {param_name}: {tensor.shape} -> {target_shape} (TP size: {tp_size}, rank: {tp_rank})")
+
+            # === 1. qweight: 按第一个维度分割 ===
+            if param_name == "qweight" and len(tensor.shape) == 2 and len(target_shape) == 2:
                 tensor_h, tensor_w = tensor.shape
                 target_h, target_w = target_shape
 
-                if tensor_h == target_h and tensor_w != target_w:
-                    tp_size = get_tensor_model_parallel_world_size()
+                # 输入维度分割: tensor_h = target_h * tp_size
+                if tensor_h == target_h * tp_size and tensor_w == target_w:
+                    start_idx = tp_rank * target_h
+                    end_idx = start_idx + target_h
+                    result = tensor[start_idx:end_idx, :].contiguous()
+                    logger.debug(f"TP split qweight by rows: rank {tp_rank} gets [{start_idx}:{end_idx}, :]")
+                    return result
 
-                    if tensor_w * tp_size == target_w:
-                        result = torch.zeros(target_shape, dtype=tensor.dtype, device=tensor.device)
-                        tp_rank = get_tensor_model_parallel_rank()
-                        start_idx = tp_rank * tensor_w
-                        end_idx = start_idx + tensor_w
-                        result[:, start_idx:end_idx] = tensor
-                        return result
-                    elif target_w * tp_size == tensor_w:
-                        tp_rank = get_tensor_model_parallel_rank()
-                        start_idx = tp_rank * target_w
-                        end_idx = start_idx + target_w
-                        result = tensor[:, start_idx:end_idx].contiguous()
-                        return result
+                # 输出维度分割: tensor_w = target_w * tp_size
+                elif tensor_h == target_h and tensor_w == target_w * tp_size:
+                    start_idx = tp_rank * target_w
+                    end_idx = start_idx + target_w
+                    result = tensor[:, start_idx:end_idx].contiguous()
+                    logger.debug(f"TP split qweight by cols: rank {tp_rank} gets [:, {start_idx}:{end_idx}]")
+                    return result
 
+                # 需要广播: target_w = tensor_w * tp_size
+                elif tensor_h == target_h and target_w == tensor_w * tp_size:
+                    result = torch.zeros(target_shape, dtype=tensor.dtype, device=tensor.device)
+                    start_idx = tp_rank * tensor_w
+                    end_idx = start_idx + tensor_w
+                    result[:, start_idx:end_idx] = tensor
+                    logger.debug(f"TP broadcast qweight: rank {tp_rank} fills [:, {start_idx}:{end_idx}]")
+                    return result
+
+            # === 2. scales 和 zeros: 按第一个维度分割 (修正!) ===
+            elif param_name in ["scales", "zeros"] and len(tensor.shape) == 2 and len(target_shape) == 2:
+                tensor_h, tensor_w = tensor.shape
+                target_h, target_w = target_shape
+
+                # 🔧 修正: 按第一个维度分割 (group 维度)
+                if tensor_h == target_h * tp_size and tensor_w == target_w:
+                    start_idx = tp_rank * target_h
+                    end_idx = start_idx + target_h
+                    result = tensor[start_idx:end_idx, :].contiguous()
+                    logger.debug(f"TP split {param_name} by rows: rank {tp_rank} gets [{start_idx}:{end_idx}, :]")
+                    return result
+
+                # 输出维度分割: tensor_w = target_w * tp_size
+                elif tensor_h == target_h and tensor_w == target_w * tp_size:
+                    start_idx = tp_rank * target_w
+                    end_idx = start_idx + target_w
+                    result = tensor[:, start_idx:end_idx].contiguous()
+                    logger.debug(f"TP split {param_name} by cols: rank {tp_rank} gets [:, {start_idx}:{end_idx}]")
+                    return result
+
+                # 需要广播: target_w = tensor_w * tp_size
+                elif tensor_h == target_h and target_w == tensor_w * tp_size:
+                    result = torch.zeros(target_shape, dtype=tensor.dtype, device=tensor.device)
+                    start_idx = tp_rank * tensor_w
+                    end_idx = start_idx + tensor_w
+                    result[:, start_idx:end_idx] = tensor
+                    logger.debug(f"TP broadcast {param_name}: rank {tp_rank} fills [:, {start_idx}:{end_idx}]")
+                    return result
+
+            # === 3. channel_scale: 按最后一个维度分割 ===
+            elif param_name == "channel_scale" and len(tensor.shape) == 3 and len(target_shape) == 3:
+                tensor_h, tensor_w, tensor_d = tensor.shape
+                target_h, target_w, target_d = target_shape
+
+                if tensor_h == target_h and tensor_w == target_w and tensor_d == target_d * tp_size:
+                    start_idx = tp_rank * target_d
+                    end_idx = start_idx + target_d
+                    result = tensor[:, :, start_idx:end_idx].contiguous()
+                    logger.debug(f"TP split channel_scale: rank {tp_rank} gets [:, :, {start_idx}:{end_idx}]")
+                    return result
+
+            # === 4. q_perm: 按唯一维度分割 ===
+            elif param_name == "q_perm" and len(tensor.shape) == 1 and len(target_shape) == 1:
+                tensor_size = tensor.shape[0]
+                target_size = target_shape[0]
+
+                if tensor_size == target_size * tp_size:
+                    start_idx = tp_rank * target_size
+                    end_idx = start_idx + target_size
+                    result = tensor[start_idx:end_idx].contiguous()
+                    logger.debug(f"TP split q_perm: rank {tp_rank} gets [{start_idx}:{end_idx}]")
+                    return result
+
+            # === 5. q_groups: 用于 mixed bitwidth 模式 ===
+            elif param_name == "q_groups" and len(tensor.shape) == 1 and len(target_shape) == 1:
+                tensor_size = tensor.shape[0]
+                target_size = target_shape[0]
+
+                if tensor_size == target_size * tp_size:
+                    start_idx = tp_rank * target_size
+                    end_idx = start_idx + target_size
+                    result = tensor[start_idx:end_idx].contiguous()
+                    logger.debug(f"TP split q_groups: rank {tp_rank} gets [{start_idx}:{end_idx}]")
+                    return result
+
+            # 如果都不匹配，详细报错
             logger.error(f"Cannot handle shape mismatch for {param_name}")
             logger.error(f"  Param shape: {target_shape} ({target_shape.numel()} elements)")
             logger.error(f"  Loaded shape: {tensor.shape} ({tensor.numel()} elements)")
-            logger.error(f"  TP size: {get_tensor_model_parallel_world_size()}")
-            logger.error(f"  TP rank: {get_tensor_model_parallel_rank()}")
+            logger.error(f"  TP size: {tp_size}, TP rank: {tp_rank}")
+
+            # 分析可能的分割方案
+            logger.error(f"  Analysis:")
+            for dim in range(len(tensor.shape)):
+                if len(target_shape) > dim:
+                    ratio = tensor.shape[dim] / target_shape[dim] if target_shape[dim] != 0 else float('inf')
+                    logger.error(f"    Dim {dim}: {tensor.shape[dim]} -> {target_shape[dim]} (ratio: {ratio:.2f})")
+
+                    # 检查是否是有效的TP分割
+                    if abs(ratio - tp_size) < 0.1:
+                        logger.error(f"      ✅ This dimension should be split by TP!")
+                    elif abs(ratio - 1.0) < 0.1:
+                        logger.error(f"      ✅ This dimension should remain the same")
+                    else:
+                        logger.error(f"      ❌ Unexpected ratio for TP splitting")
 
             raise ValueError(
                 f"Shape mismatch for {param_name}:\n"
                 f"  Expected: {target_shape} ({target_shape.numel()} elements)\n"
                 f"  Got: {tensor.shape} ({tensor.numel()} elements)\n"
-                f"  This indicates a mismatch between model architecture and weight file."
+                f"  TP size: {tp_size}, TP rank: {tp_rank}\n"
+                f"  This indicates GBA tensor parallel support needs more cases."
             )
 
         try:
