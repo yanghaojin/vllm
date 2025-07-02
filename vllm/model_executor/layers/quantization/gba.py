@@ -8,7 +8,11 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.logger import init_logger
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.gba_moe_support import apply_moe_quant_strategy
-from vllm.distributed import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    get_tensor_model_parallel_rank,
+    tensor_model_parallel_all_reduce
+)
 
 
 logger = init_logger(__name__)
@@ -136,6 +140,8 @@ class GBALinearMethod(LinearMethodBase):
         output_size_per_partition = sum(output_partition_sizes)
         gba_weight_loader = self._get_gba_weight_loader()
         layer_prefix = extra_weight_attrs.get("prefix", "")
+
+        layer._layer_prefix = layer_prefix
 
         is_moe_expert = 'mlp.experts.' in layer_prefix and any(
             proj in layer_prefix for proj in ['gate_proj', 'up_proj', 'down_proj'])
@@ -297,6 +303,14 @@ class GBALinearMethod(LinearMethodBase):
     def _gba_weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor, param_name: str) -> None:
         """GBA quantized weight loader implementation with debugging"""
 
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+
+        if tp_size > 1:
+            logger.info(f"GBA TP Loading - Rank {tp_rank}: {param_name}")
+            logger.info(f"GBA TP Loading - Rank {tp_rank}: param shape: {param.shape}")
+            logger.info(f"GBA TP Loading - Rank {tp_rank}: loaded weight shape: {loaded_weight.shape}")
+
         def ensure_dtype(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
             if tensor.dtype != dtype:
                 converted = tensor.to(dtype)
@@ -312,6 +326,47 @@ class GBALinearMethod(LinearMethodBase):
                 return converted
             return tensor
 
+        def _remap_qperm_indices(q_perm: torch.Tensor, target_shape: torch.Size, tp_rank: int,
+                                 tp_size: int) -> torch.Tensor:
+            """
+            重新映射 q_perm 索引到本地范围
+
+            Args:
+                q_perm: 分割后的 q_perm 张量
+                target_shape: 目标形状
+                tp_rank: 当前 TP rank
+                tp_size: TP world size
+
+            Returns:
+                重新映射后的 q_perm
+            """
+            target_size = target_shape[0]
+
+            # 计算当前 rank 对应的全局索引范围
+            global_start = tp_rank * target_size
+            global_end = global_start + target_size
+
+            # 创建索引映射：全局索引 -> 本地索引
+            # 对于超出当前 rank 范围的索引，映射到 -1 (稍后处理)
+            remapped = torch.full_like(q_perm, -1)
+
+            # 找到在当前 rank 范围内的索引
+            valid_mask = (q_perm >= global_start) & (q_perm < global_end)
+
+            # 将有效索引重新映射到本地范围 [0, target_size)
+            remapped[valid_mask] = q_perm[valid_mask] - global_start
+
+            # 处理无效索引：
+            # 方案1：简单映射 - 直接使用连续索引
+            if torch.any(remapped == -1):
+                logger.warning(f"TP Rank {tp_rank}: q_perm contains out-of-range indices, using sequential mapping")
+                remapped = torch.arange(target_size, dtype=q_perm.dtype, device=q_perm.device)
+
+            logger.debug(
+                f"TP Rank {tp_rank}: q_perm remapped from global range [{global_start}:{global_end}] to local [0:{target_size}]")
+
+            return remapped
+
         # 在 gba.py 的 ensure_shape 函数中添加完整的 GBA tensor parallel 支持
         def ensure_shape(tensor: torch.Tensor, target_shape: torch.Size, param_name: str) -> torch.Tensor:
             """Corrected ensure_shape with proper GBA tensor parallel support"""
@@ -323,18 +378,44 @@ class GBALinearMethod(LinearMethodBase):
                 logger.debug(f"Reshaping {param_name}: {tensor.shape} -> {target_shape}")
                 reshaped = tensor.view(target_shape)
 
-                # Check for numerical stability in scale parameters
-                if 'scale' in param_name.lower():
-                    after_reshape_invalid = torch.any(reshaped <= 0)
-                    before_reshape_invalid = torch.any(tensor <= 0)
-                    if after_reshape_invalid and not before_reshape_invalid:
-                        logger.error(f"Reshape introduced invalid values in {param_name}!")
+                # 检查是否需要重新映射 q_perm 索引
+                if param_name == "q_perm" and tp_size > 1:
+                    return _remap_qperm_indices(reshaped, target_shape, tp_rank, tp_size)
 
-                return reshaped
+            # TP环境下的特殊处理
+            if tp_size > 1:
+                logger.debug(f"TP Shape Analysis - Rank {tp_rank}: {param_name}")
+                logger.debug(f"  Tensor shape: {tensor.shape} ({tensor.numel()} elements)")
+                logger.debug(f"  Target shape: {target_shape} ({target_shape.numel()} elements)")
 
-            # Get tensor parallel info
-            tp_size = get_tensor_model_parallel_world_size()
-            tp_rank = get_tensor_model_parallel_rank()
+                # 详细的维度分析
+                for dim in range(max(len(tensor.shape), len(target_shape))):
+                    if dim < len(tensor.shape) and dim < len(target_shape):
+                        ratio = tensor.shape[dim] / target_shape[dim] if target_shape[dim] != 0 else float('inf')
+                        logger.debug(f"  Dim {dim}: {tensor.shape[dim]} -> {target_shape[dim]} (ratio: {ratio:.2f})")
+
+                        if abs(ratio - tp_size) < 0.1:
+                            logger.debug(f"    -> This dimension should be split by TP!")
+                        elif abs(ratio - 1.0) < 0.1:
+                            logger.debug(f"    -> This dimension should remain the same")
+
+                # === q_perm 的特殊处理：分割 + 重映射索引 ===
+                if param_name == "q_perm" and len(tensor.shape) == 1 and len(target_shape) == 1:
+                    tensor_size = tensor.shape[0]
+                    target_size = target_shape[0]
+
+                    if tensor_size == target_size * tp_size:
+                        # 1. 首先分割 q_perm
+                        start_idx = tp_rank * target_size
+                        end_idx = start_idx + target_size
+                        sliced_perm = tensor[start_idx:end_idx].contiguous()
+
+                        # 2. 重新映射索引到本地范围
+                        remapped_perm = _remap_qperm_indices(sliced_perm, target_shape, tp_rank, tp_size)
+
+                        logger.debug(
+                            f"TP split q_perm: rank {tp_rank} gets [{start_idx}:{end_idx}] with index remapping")
+                        return remapped_perm
 
             logger.debug(
                 f"Attempting TP split for {param_name}: {tensor.shape} -> {target_shape} (TP size: {tp_size}, rank: {tp_rank})")
@@ -369,7 +450,7 @@ class GBALinearMethod(LinearMethodBase):
                     logger.debug(f"TP broadcast qweight: rank {tp_rank} fills [:, {start_idx}:{end_idx}]")
                     return result
 
-            # === 2. scales 和 zeros: 按第一个维度分割 (修正!) ===
+            # === 2. scales 和 zeros: 按第一个维度分割 ===
             elif param_name in ["scales", "zeros"] and len(tensor.shape) == 2 and len(target_shape) == 2:
                 tensor_h, tensor_w = tensor.shape
                 target_h, target_w = target_shape
@@ -467,8 +548,10 @@ class GBALinearMethod(LinearMethodBase):
         try:
             loaded_weight = ensure_dtype(loaded_weight, param.dtype)
             shaped_weight = ensure_shape(loaded_weight, param.shape, param_name)
-
             param.data.copy_(shaped_weight)
+
+            if tp_size > 1:
+                logger.info(f"GBA TP Success - Rank {tp_rank}: {param_name} loaded successfully")
 
         except Exception as e:
             logger.error(f"Failed to load weight {param_name}: {e}")
@@ -689,13 +772,123 @@ class GBALinearMethod(LinearMethodBase):
         # Mark as ready
         layer._gba_ready = True
 
+    def _get_tp_strategy_from_prefix(self, layer_prefix: str) -> str:
+        """
+        基于层前缀判断 TP 分割策略
+
+        Args:
+            layer_prefix: 层的前缀名称，如 'model.layers.0.self_attn.q_proj'
+
+        Returns:
+            'column': Column parallel，按输出维度分割，需要 all_reduce
+            'row': Row parallel，按输入维度分割，不需要 all_reduce
+        """
+
+        # Column Parallel 层：按输出维度分割，需要 all_reduce
+        column_parallel_patterns = [
+            # Attention 相关的 query, key, value 投影
+            'q_proj', 'k_proj', 'v_proj', 'qkv_proj',
+            # MLP 的输入投影
+            'gate_proj', 'up_proj', 'gate_up_proj',
+            # MoE 专家网络的输入投影
+            'experts.gate_proj', 'experts.up_proj'
+        ]
+
+        # Row Parallel 层：按输入维度分割，不需要 all_reduce
+        row_parallel_patterns = [
+            # Attention 的输出投影
+            'o_proj',
+            # MLP 的输出投影
+            'down_proj',
+            # MoE 专家网络的输出投影
+            'experts.down_proj'
+        ]
+
+        # 检查是否匹配 Column Parallel 模式
+        for pattern in column_parallel_patterns:
+            if pattern in layer_prefix:
+                return 'column'
+
+        # 检查是否匹配 Row Parallel 模式
+        for pattern in row_parallel_patterns:
+            if pattern in layer_prefix:
+                return 'row'
+
+        # 默认策略：对于未知层类型，记录警告并假设为 column parallel
+        logger.warning(f"Unknown TP strategy for layer: {layer_prefix}, defaulting to column parallel")
+        return 'column'
+
+    def _validate_and_adjust_input_for_tp(self, layer: torch.nn.Module, x: torch.Tensor,
+                                          tp_size: int, tp_rank: int, strategy: str) -> torch.Tensor:
+        """
+        验证输入维度并根据 TP 策略调整输入 - 修复版本
+        """
+        expected_input_features = layer.qweight.size(0) * (32 // layer.weight_bits)
+        current_input_features = x.size(-1)
+
+        logger.debug(f"TP Rank {tp_rank}: Input validation - "
+                     f"current={current_input_features}, expected={expected_input_features}, "
+                     f"strategy={strategy}")
+
+        if strategy == 'column':
+            # Column Parallel: 权重按输出维度分割，输入通常完整
+            if current_input_features == expected_input_features:
+                # 正常情况：输入完整，无需调整
+                return x.contiguous()
+            elif current_input_features == expected_input_features * tp_size:
+                # 特殊情况：输入也被分割了，需要提取对应部分
+                start_idx = tp_rank * expected_input_features
+                end_idx = start_idx + expected_input_features
+                adjusted_x = x[..., start_idx:end_idx].contiguous()
+                logger.debug(f"TP Rank {tp_rank}: Column parallel input slicing [{start_idx}:{end_idx}]")
+                return adjusted_x
+            else:
+                # 尝试其他可能的分割情况
+                logger.warning(f"TP Rank {tp_rank}: Unexpected input dimension for column parallel")
+                logger.warning(
+                    f"  current={current_input_features}, expected={expected_input_features}, tp_size={tp_size}")
+                # 直接返回，让 CUDA 层报错
+                return x.contiguous()
+
+        elif strategy == 'row':
+            # Row Parallel: 权重按输入维度分割，输入也应该被分割
+            if current_input_features == expected_input_features:
+                # 正常情况：输入已经被正确分割
+                return x.contiguous()
+            elif current_input_features == expected_input_features * tp_size:
+                # 输入还没有被分割，需要提取对应部分
+                start_idx = tp_rank * expected_input_features
+                end_idx = start_idx + expected_input_features
+                adjusted_x = x[..., start_idx:end_idx].contiguous()
+                logger.debug(f"TP Rank {tp_rank}: Row parallel input slicing [{start_idx}:{end_idx}]")
+                return adjusted_x
+            else:
+                logger.warning(f"TP Rank {tp_rank}: Unexpected input dimension for row parallel")
+                logger.warning(
+                    f"  current={current_input_features}, expected={expected_input_features}, tp_size={tp_size}")
+                return x.contiguous()
+
+        else:
+            raise ValueError(f"Unknown TP strategy: {strategy}")
+
+    def _check_tensor_validity(self, tensor: torch.Tensor, name: str, tp_rank: int) -> None:
+        """检查张量的有效性"""
+        if not tensor.is_contiguous():
+            logger.warning(f"TP Rank {tp_rank}: {name} tensor is not contiguous")
+
+        if torch.isnan(tensor).any():
+            logger.error(f"TP Rank {tp_rank}: {name} tensor contains NaN values")
+
+        if torch.isinf(tensor).any():
+            logger.error(f"TP Rank {tp_rank}: {name} tensor contains Inf values")
+
     def apply(
             self,
             layer: torch.nn.Module,
             x: torch.Tensor,
             bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Execute forward propagation with robust channel_scale handling"""
+        """Execute forward propagation with enhanced TP debugging and error handling"""
         if not hasattr(layer, '_gba_ready'):
             self._prepare_layer_cache(layer)
 
@@ -713,18 +906,105 @@ class GBALinearMethod(LinearMethodBase):
         if layer._has_channel_scale:
             x = x * layer._channel_scale_cached
 
-        output = ops.gba_linear_forward(
-            x,
-            layer.qweight,
-            layer._scales_cached,
-            layer._zeros_cached,
-            layer.q_perm,
-            layer.group_size,
-            layer.weight_bits,
-            self.quant_config.use_mbw,
-            layer._q_group_map_cached,
-            layer._rows_list_cached,
-        )
+        # 获取 TP 信息
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+
+        # TP 策略判断和输入调整
+        needs_all_reduce = False
+        original_x_shape = x.shape
+
+        if tp_size > 1:
+            layer_prefix = getattr(layer, '_layer_prefix', '')
+
+            # 判断 TP 策略
+            tp_strategy = self._get_tp_strategy_from_prefix(layer_prefix)
+            needs_all_reduce = (tp_strategy == 'column')
+
+            logger.debug(f"TP Rank {tp_rank}: Processing {layer_prefix}")
+            logger.debug(f"  Strategy: {tp_strategy}, needs_all_reduce: {needs_all_reduce}")
+            logger.debug(f"  Original input shape: {original_x_shape}")
+            logger.debug(f"  qweight shape: {layer.qweight.shape}")
+            logger.debug(f"  Expected input features: {layer.qweight.size(0) * (32 // layer.weight_bits)}")
+            if 'o_proj' in layer_prefix:
+                logger.error(f"O_PROJ DEBUG - Rank {tp_rank}:")
+                logger.error(f"  scales shape: {layer._scales_cached.shape}")
+                logger.error(f"  zeros shape: {layer._zeros_cached.shape}")
+                logger.error(f"  group_size: {layer.group_size}")
+                logger.error(f"  input_features: {x.shape[-1]}")
+                logger.error(f"  expected_groups: {x.shape[-1] // layer.group_size}")
+
+            # 验证输入张量
+            self._check_tensor_validity(x, "input", tp_rank)
+
+            # 验证和调整输入
+            try:
+                x = self._validate_and_adjust_input_for_tp(layer, x, tp_size, tp_rank, tp_strategy)
+                logger.debug(f"  Adjusted input shape: {x.shape}")
+            except Exception as e:
+                logger.error(f"TP Rank {tp_rank}: Failed to adjust input for {layer_prefix}: {e}")
+                raise e
+
+            # 最终验证
+            if not x.is_contiguous():
+                logger.warning(f"TP Rank {tp_rank}: Input tensor is not contiguous after adjustment")
+                x = x.contiguous()
+
+        # 确保所有必要的张量都是 contiguous 的
+        if not layer.qweight.is_contiguous():
+            logger.warning(f"TP Rank {tp_rank}: qweight is not contiguous")
+        if not layer._scales_cached.is_contiguous():
+            logger.warning(f"TP Rank {tp_rank}: scales is not contiguous")
+        if not layer._zeros_cached.is_contiguous():
+            logger.warning(f"TP Rank {tp_rank}: zeros is not contiguous")
+
+        try:
+            # 添加CUDA同步以确保内存操作完成
+            if tp_size > 1:
+                torch.cuda.synchronize()
+
+            output = ops.gba_linear_forward(
+                x,
+                layer.qweight,
+                layer._scales_cached,
+                layer._zeros_cached,
+                layer.q_perm,
+                layer.group_size,
+                layer.weight_bits,
+                self.quant_config.use_mbw,
+                layer._q_group_map_cached,
+                layer._rows_list_cached,
+                tp_size,
+                tp_rank
+            )
+
+            if tp_size > 1:
+                torch.cuda.synchronize()
+
+        except RuntimeError as e:
+            if tp_size > 1:
+                layer_prefix = getattr(layer, '_layer_prefix', 'unknown')
+                logger.error(f"TP CUDA Error - Rank {tp_rank}, Layer {layer_prefix}: {e}")
+                logger.error(f"  Input shape: {x.shape}")
+                logger.error(f"  Input contiguous: {x.is_contiguous()}")
+                logger.error(f"  Input device: {x.device}")
+                logger.error(f"  Input dtype: {x.dtype}")
+                logger.error(f"  qweight shape: {layer.qweight.shape}")
+                logger.error(f"  qweight contiguous: {layer.qweight.is_contiguous()}")
+                logger.error(f"  Expected input features: {layer.qweight.size(0) * (32 // layer.weight_bits)}")
+                logger.error(f"  TP strategy: {tp_strategy if 'tp_strategy' in locals() else 'unknown'}")
+
+                # 添加内存诊断
+                logger.error(f"  GPU memory allocated: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+                logger.error(f"  GPU memory cached: {torch.cuda.memory_reserved() / 1024 ** 3:.2f} GB")
+            raise e
+
+        # 根据策略决定是否进行 all_reduce
+        if tp_size > 1 and needs_all_reduce:
+            from vllm.distributed import tensor_model_parallel_all_reduce
+            layer_prefix = getattr(layer, '_layer_prefix', 'unknown')
+            logger.debug(f"TP Rank {tp_rank}: Performing all_reduce for {layer_prefix}")
+            output = tensor_model_parallel_all_reduce(output)
 
         if bias is not None:
             output = output + bias
