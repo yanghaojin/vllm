@@ -362,7 +362,9 @@ torch::Tensor gba_linear_forward(
     int64_t bits,
     bool use_mbw,
     torch::Tensor q_group_map,
-    std::vector<int64_t> rows);
+    std::vector<int64_t> rows,
+    int64_t tp_size,
+    int64_t tp_rank);
 
 std::tuple<torch::Tensor, std::vector<int64_t>> gba_trans_qweight(
     torch::Tensor qweight,
