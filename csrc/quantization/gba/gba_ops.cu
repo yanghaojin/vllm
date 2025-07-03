@@ -741,24 +741,17 @@ torch::Tensor mbwq_linear_q4_forward_cuda(
     torch::Tensor zeros,
     int group_size,
     torch::Tensor q_perm,
-    int bits,
-    int tp_size,
-    int tp_rank
+    int bits
 ){
     const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
 
     TORCH_CHECK(x.dtype() == torch::kHalf);
+    TORCH_CHECK(x.size(1) == qweight.size(0) * (32 / bits));
 
 	int size_m = x.size(0);       // m
     int size_n = qweight.size(1); // n
 	int size_k = x.size(1);       // k
     int groups = scales.size(0);  // in_channles/group_size
-
-    // 验证基本维度兼容性
-    int expected_input_features = qweight.size(0) * (32 / bits);
-    TORCH_CHECK(size_k == expected_input_features,
-        "Input dimension mismatch: expected ", expected_input_features,
-        " but got ", size_k, " (TP size: ", tp_size, ", rank: ", tp_rank, ")");
 
 	auto option_output = torch::TensorOptions().dtype(x.dtype()).device(x.device());
 	auto out = torch::zeros({size_m, size_n}, option_output);
@@ -766,7 +759,7 @@ torch::Tensor mbwq_linear_q4_forward_cuda(
 	if (size_m > MAX_Q_GEMM_ROWS){
         // Reconstruct FP16 matrix and using cuBLAS for gemm
         auto fp_w = mbwq_linear_q42fp_weight_cuda(
-			            qweight,
+                        qweight,
 						scales,
 						zeros,
 						group_size,
@@ -933,9 +926,7 @@ torch::Tensor mbwq_linear_exl2_forward_cuda(
     torch::Tensor qperm,
     torch::Tensor qgroup_map,
     std::vector<int> rows,
-    bool use_cublas,
-    int tp_size,
-    int tp_rank
+    bool use_cublas
 ){
     const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
     TORCH_CHECK(x.dtype() == torch::kHalf);
@@ -944,11 +935,6 @@ torch::Tensor mbwq_linear_exl2_forward_cuda(
     int size_n = qweight.size(1); // n
 	int size_k = qperm.size(0);   // k
     int groups = scales.size(0);
-
-	// 验证基本维度兼容性
-    TORCH_CHECK(x.size(1) == size_k,
-        "Input dimension mismatch in EXL2: expected ", size_k,
-        " but got ", x.size(1), " (TP size: ", tp_size, ", rank: ", tp_rank, ")");
 
 	auto option_output = torch::TensorOptions().dtype(torch::kHalf).device(x.device());
 	auto out = torch::zeros({size_m, size_n}, option_output);
@@ -1030,37 +1016,27 @@ torch::Tensor gba_linear_forward(
     int64_t bits_64,
     bool use_mbw,
     torch::Tensor q_group_map,
-    std::vector<int64_t> rows_64,
-    int64_t tp_size_64,
-    int64_t tp_rank_64) {
+    std::vector<int64_t> rows_64) {
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
 
     int group_size = static_cast<int>(group_size_64);
     int bits = static_cast<int>(bits_64);
-    int tp_size = static_cast<int>(tp_size_64);
-    int tp_rank = static_cast<int>(tp_rank_64);
-
     std::vector<int> rows;
     rows.reserve(rows_64.size());
     for (int64_t val : rows_64) {
         rows.push_back(static_cast<int>(val));
     }
 
-    if (tp_size > 1) {
-        printf("CUDA TP Debug - Rank %d: x.shape=[%ld,%ld], qweight.shape=[%ld,%ld], bits=%d\n",
-               tp_rank, x.size(0), x.size(1), qweight.size(0), qweight.size(1), bits);
-    }
-
     if (!use_mbw) {
         // 标准量化模式
         return mbwq_linear_q4_forward_cuda(
-            x, qweight, qscales, qzeros, group_size, q_perm, bits, tp_size, tp_rank
+            x, qweight, qscales, qzeros, group_size, q_perm, bits
         );
     } else {
         // 混合位宽模式
         return mbwq_linear_exl2_forward_cuda(
-            x, qweight, qscales, qzeros, q_perm, q_group_map, rows, false, tp_size, tp_rank
+            x, qweight, qscales, qzeros, q_perm, q_group_map, rows, false
         );
     }
 }

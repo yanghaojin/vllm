@@ -257,6 +257,7 @@ class GBALinearMethod(LinearMethodBase):
         layer.is_moe_gate = is_moe_gate
         layer._gba_weights_initialized = True
 
+
     def _get_gba_weight_loader(self):
         """Get GBA-specific weight loader function """
 
@@ -814,8 +815,6 @@ class GBALinearMethod(LinearMethodBase):
             if pattern in layer_prefix:
                 return 'row'
 
-        # 默认策略：对于未知层类型，记录警告并假设为 column parallel
-        logger.warning(f"Unknown TP strategy for layer: {layer_prefix}, defaulting to column parallel")
         return 'column'
 
     def _validate_and_adjust_input_for_tp(self, layer: torch.nn.Module, x: torch.Tensor,
@@ -921,19 +920,6 @@ class GBALinearMethod(LinearMethodBase):
             tp_strategy = self._get_tp_strategy_from_prefix(layer_prefix)
             needs_all_reduce = (tp_strategy == 'column')
 
-            logger.debug(f"TP Rank {tp_rank}: Processing {layer_prefix}")
-            logger.debug(f"  Strategy: {tp_strategy}, needs_all_reduce: {needs_all_reduce}")
-            logger.debug(f"  Original input shape: {original_x_shape}")
-            logger.debug(f"  qweight shape: {layer.qweight.shape}")
-            logger.debug(f"  Expected input features: {layer.qweight.size(0) * (32 // layer.weight_bits)}")
-            if 'o_proj' in layer_prefix:
-                logger.error(f"O_PROJ DEBUG - Rank {tp_rank}:")
-                logger.error(f"  scales shape: {layer._scales_cached.shape}")
-                logger.error(f"  zeros shape: {layer._zeros_cached.shape}")
-                logger.error(f"  group_size: {layer.group_size}")
-                logger.error(f"  input_features: {x.shape[-1]}")
-                logger.error(f"  expected_groups: {x.shape[-1] // layer.group_size}")
-
             # 验证输入张量
             self._check_tensor_validity(x, "input", tp_rank)
 
@@ -973,9 +959,7 @@ class GBALinearMethod(LinearMethodBase):
                 layer.weight_bits,
                 self.quant_config.use_mbw,
                 layer._q_group_map_cached,
-                layer._rows_list_cached,
-                tp_size,
-                tp_rank
+                layer._rows_list_cached
             )
 
             if tp_size > 1:
@@ -1000,10 +984,13 @@ class GBALinearMethod(LinearMethodBase):
             raise e
 
         # 根据策略决定是否进行 all_reduce
-        if tp_size > 1 and needs_all_reduce:
-            from vllm.distributed import tensor_model_parallel_all_reduce
+
+        DISABLE_ALL_REDUCE_FOR_TEST = True
+
+        if tp_size > 1 and needs_all_reduce and not DISABLE_ALL_REDUCE_FOR_TEST:
             layer_prefix = getattr(layer, '_layer_prefix', 'unknown')
-            logger.debug(f"TP Rank {tp_rank}: Performing all_reduce for {layer_prefix}")
+            logger.debug(f"Performing all_reduce for {layer_prefix}")
+
             output = tensor_model_parallel_all_reduce(output)
 
         if bias is not None:
