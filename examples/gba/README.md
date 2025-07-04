@@ -47,9 +47,23 @@ vllm/
 
 ### 1. Installation
 
-Ensure GBA CUDA extensions are compiled:
+1. Create Environment for Python 3.11 and activate it:
 ```bash
+conda create -y --name vllm-gba python=3.11
+conda activate vllm-gba
+```
+
+2. Ensure GBA CUDA extensions are compiled:
+```bash
+cd vllm
 pip install -e . --verbose
+```
+
+3. Install FlashInfer
+```bash
+git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
+cd flashinfer
+python -m pip install -v .
 ```
 
 ### 2. Basic Usage
