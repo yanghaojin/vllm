@@ -595,7 +595,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
     "gba_linear_forward(Tensor x, Tensor qweight, Tensor qscales, "
     "Tensor qzeros, Tensor q_perm, int group_size, int bits, "
-    "bool use_mbw, Tensor q_group_map, int[] rows, int tp_size, int tp_rank) -> Tensor",
+    "bool use_mbw, Tensor q_group_map, int[] rows) -> Tensor",
     {stride_tag});
   ops.impl("gba_linear_forward", torch::kCUDA, &gba_linear_forward);
 

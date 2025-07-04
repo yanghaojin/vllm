@@ -1792,9 +1792,7 @@ def gba_linear_forward(
     bits: int,
     use_mbw: bool,
     q_group_map: torch.Tensor = None,
-    rows: list = None,
-    tp_size: int = 1,
-    tp_rank: int = 0,
+    rows: list = None
 ) -> torch.Tensor:
     """GBA quantized linear forward operation."""
     if q_group_map is None:
@@ -1804,7 +1802,7 @@ def gba_linear_forward(
 
     return torch.ops._C.gba_linear_forward(
         x, qweight, qscales, qzeros, q_perm, group_size, bits, use_mbw,
-        q_group_map, rows, tp_size, tp_rank
+        q_group_map, rows
     )
 
 
