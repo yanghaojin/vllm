@@ -124,32 +124,41 @@ python examples/gba/single_vs_multi_test.py
 
 ```
 vllm/
-├── README.md                                                                          (modified)
 │
-├── model_executor/
-│   ├── layers/
-│   │   └── quantization/
-│   │       ├── gba_moe_support.py        # GBA moe related support methods            (added)
-│   │       ├── gba.py                    # Core GBA quantization implementation       (added)
-│   │       └── model_integration.py      # Model integration and layer replacement    (added)
-│   │
-│   └── model_loader/
-│       └──weight_utils.py                # Enhanced weight loading                    (modified)
-│
-├── transformers_utils/
-│   └── config.py                         # Configuration detection                    (modified)
-│
+├── README.md                                                                             (modified)
+├── CMakeLists.txt                           # Adaption for GBA files                     (modified)
 ├── csrc/
 │   ├── quantization/
-│   │   └── gba/                                                                       (added)
-│   │       ├── gba_ops.cu               # CUDA kernel implementations                 
-│   │       └── exl2/...                 # Exl2 cuda kernel implementations            
-│   ├── ops.h                            # GBA operators                               (modified)
-│   └── torch_bindings.cpp               # PyTorch bindings                            (modified)
+│   │   └── gba/                                                                           (added)
+│   │       ├── gba_ops.cu                   # CUDA kernel implementations                 
+│   │       └── exl2/...                     # Exl2 cuda kernel implementations            
+│   ├── ops.h                                # GBA operators                               (modified)
+│   └── torch_bindings.cpp                   # PyTorch bindings                            (modified)
 │
-└── examples/
-    └── gba/                                                                           (added)
-        ├── single_vs_multi_test.py       # single and multi GPU execution tests
-        ├── start_vllm_server.sh          # Start a testing server using gba models
-        └── test_vllm_api.py              # Testing client in conjunction with start_vllm_server.sh
+├── examples/
+│   └── gba/                                                                               (added)
+│       ├── single_vs_multi_test.py           # single and multi GPU execution tests
+│       ├── start_vllm_server.sh              # Start a testing server using gba models
+│       └── test_vllm_api.py                  # Testing client in conjunction with start_vllm_server.sh
+└── vllm/         
+    ├── _custom_ops.py                        # Python wrapper for GBA operators           (modified)    
+    ├── model_executor/
+    │   ├── layers/
+    │   │   ├── linear.py                     # Adapted for weight loading                 (modified)
+    │   │   └── quantization/
+    │   │       ├── __init__.py               # GBA quant registration                     (modified)    
+    │   │       ├── gba_moe_support.py        # GBA moe related support methods            (added)
+    │   │       ├── gba.py                    # Core GBA quantization implementation       (added)
+    │   │       └── model_integration.py      # Model integration and layer replacement    (added)
+    │   │
+    │   ├── models/
+    │   │    ├── qwen2.py                     # Adated for GBA format                      (modified)
+    │   │    ├── qwen3.py                     # Adated for GBA format                      (modified)
+    │   │    └── qwen3_moe.py                 # Adated for GBA format                      (modified)
+    │   │     
+    │   └── model_loader/
+    │       └──weight_utils.py                # Enhanced weight loading                    (modified)
+    │
+    └── transformers_utils/
+        └── config.py                         # Configuration detection                    (modified)
 ```
