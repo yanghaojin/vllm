@@ -5,15 +5,15 @@
 
 # You can also start serving as follows:
 #vllm serve GreenBitAI/Qwen-3-0.6B-layer-mix-bpw-4.0 \
-#--quantization gba \
-#--tensor-parallel-size 4 \
-#--dtype float16 \
-#--max-model-len 4096 \
-#--gpu-memory-utilization 0.8 \
-#--host 0.0.0.0 \
-#--port 8000  \
-#--trust-remote-code  \
-#--enforce-eager
+#  --quantization gba \
+#  --tensor-parallel-size 4 \
+#  --dtype float16 \
+#  --max-model-len 4096 \
+#  --gpu-memory-utilization 0.8 \
+#  --host 0.0.0.0 \
+#  --port 8000  \
+#  --trust-remote-code  \
+#  --enforce-eager
 
 
 # Default values
