@@ -1,4 +1,5 @@
 import re
+import os
 from typing import Any, Dict, List, Optional, Union, Callable
 import torch
 
@@ -11,9 +12,9 @@ from vllm.model_executor.layers.quantization.gba_moe_support import apply_moe_qu
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tensor_model_parallel_rank,
-    tensor_model_parallel_all_reduce
+    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_all_gather
 )
-
 
 logger = init_logger(__name__)
 
@@ -32,9 +33,6 @@ class GBAConfig(QuantizationConfig):
         self.group_size = group_size
         self.use_mbw = use_mbw
         self.strategy = strategy or {}
-
-        self._moe_info = None
-        self._moe_detected = False
 
         # Validate parameters
         if self.weight_bits not in [2, 3, 4, 5, 6, 8]:
@@ -89,11 +87,6 @@ class GBAConfig(QuantizationConfig):
             use_mbw=use_mbw,
             strategy=strategy,
         )
-
-        # Add MoE info if present and apply patches
-        if 'moe_info' in config:
-            instance.moe_info = config['moe_info']
-            instance._config_dict = config
 
         return instance
 
@@ -199,7 +192,7 @@ class GBALinearMethod(LinearMethodBase):
             "weight_loader": gba_weight_loader
         })
 
-        # 🔧 q_perm: 确保大小正确对应 input_size_per_partition
+        # q_perm: 确保大小正确对应 input_size_per_partition
         q_perm = torch.nn.Parameter(
             torch.empty(input_size_per_partition, dtype=torch.int16, device="cuda"),
             requires_grad=False,
@@ -211,7 +204,7 @@ class GBALinearMethod(LinearMethodBase):
             "weight_loader": gba_weight_loader
         })
 
-        # 🔧 channel_scale: 确保大小正确对应 input_size_per_partition
+        # channel_scale: 确保大小正确对应 input_size_per_partition
         channel_scale = torch.nn.Parameter(
             torch.ones((1, 1, input_size_per_partition), dtype=params_dtype, device="cuda"),
             requires_grad=False,
@@ -226,7 +219,7 @@ class GBALinearMethod(LinearMethodBase):
 
         # Mixed bit-width mode requires additional parameters
         if self.quant_config.use_mbw:
-            # 🔧 q_groups: 也可能需要按 TP 分割
+            # q_groups: You may also need to split by TP
             q_groups = torch.nn.Parameter(
                 torch.empty(num_groups * 2, dtype=torch.int16, device="cuda"),
                 requires_grad=False,
@@ -307,10 +300,22 @@ class GBALinearMethod(LinearMethodBase):
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
 
-        if tp_size > 1:
-            logger.info(f"GBA TP Loading - Rank {tp_rank}: {param_name}")
-            logger.info(f"GBA TP Loading - Rank {tp_rank}: param shape: {param.shape}")
-            logger.info(f"GBA TP Loading - Rank {tp_rank}: loaded weight shape: {loaded_weight.shape}")
+        # Extract layer name for MoE detection
+        layer_name = None
+        if hasattr(param, '_layer_prefix'):
+            layer_name = param._layer_prefix
+        elif hasattr(param, 'layer') and hasattr(param.layer, '_layer_prefix'):
+            layer_name = param.layer._layer_prefix
+
+        # Default to parameter name if no layer info available
+        if layer_name is None:
+            module_path = []
+            parent = param
+            while hasattr(parent, 'parent'):
+                parent = parent.parent
+                if hasattr(parent, 'name'):
+                    module_path.append(parent.name)
+            layer_name = '.'.join(reversed(module_path)) if module_path else param_name
 
         def ensure_dtype(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
             if tensor.dtype != dtype:
@@ -360,11 +365,7 @@ class GBALinearMethod(LinearMethodBase):
             # 处理无效索引：
             # 方案1：简单映射 - 直接使用连续索引
             if torch.any(remapped == -1):
-                logger.warning(f"TP Rank {tp_rank}: q_perm contains out-of-range indices, using sequential mapping")
                 remapped = torch.arange(target_size, dtype=q_perm.dtype, device=q_perm.device)
-
-            logger.debug(
-                f"TP Rank {tp_rank}: q_perm remapped from global range [{global_start}:{global_end}] to local [0:{target_size}]")
 
             return remapped
 
@@ -376,29 +377,21 @@ class GBALinearMethod(LinearMethodBase):
                 return tensor
 
             if tensor.numel() == target_shape.numel():
-                logger.debug(f"Reshaping {param_name}: {tensor.shape} -> {target_shape}")
                 reshaped = tensor.view(target_shape)
 
                 # 检查是否需要重新映射 q_perm 索引
                 if param_name == "q_perm" and tp_size > 1:
                     return _remap_qperm_indices(reshaped, target_shape, tp_rank, tp_size)
 
+            # Check if this is a MoE expert parameter
+            is_moe_expert = 'experts.' in layer_name if layer_name else False
+
             # TP环境下的特殊处理
             if tp_size > 1:
-                logger.debug(f"TP Shape Analysis - Rank {tp_rank}: {param_name}")
-                logger.debug(f"  Tensor shape: {tensor.shape} ({tensor.numel()} elements)")
-                logger.debug(f"  Target shape: {target_shape} ({target_shape.numel()} elements)")
-
                 # 详细的维度分析
                 for dim in range(max(len(tensor.shape), len(target_shape))):
                     if dim < len(tensor.shape) and dim < len(target_shape):
                         ratio = tensor.shape[dim] / target_shape[dim] if target_shape[dim] != 0 else float('inf')
-                        logger.debug(f"  Dim {dim}: {tensor.shape[dim]} -> {target_shape[dim]} (ratio: {ratio:.2f})")
-
-                        if abs(ratio - tp_size) < 0.1:
-                            logger.debug(f"    -> This dimension should be split by TP!")
-                        elif abs(ratio - 1.0) < 0.1:
-                            logger.debug(f"    -> This dimension should remain the same")
 
                 # === q_perm 的特殊处理：分割 + 重映射索引 ===
                 if param_name == "q_perm" and len(tensor.shape) == 1 and len(target_shape) == 1:
@@ -414,24 +407,26 @@ class GBALinearMethod(LinearMethodBase):
                         # 2. 重新映射索引到本地范围
                         remapped_perm = _remap_qperm_indices(sliced_perm, target_shape, tp_rank, tp_size)
 
-                        logger.debug(
-                            f"TP split q_perm: rank {tp_rank} gets [{start_idx}:{end_idx}] with index remapping")
                         return remapped_perm
 
-            logger.debug(
-                f"Attempting TP split for {param_name}: {tensor.shape} -> {target_shape} (TP size: {tp_size}, rank: {tp_rank})")
 
             # === 1. qweight: 按第一个维度分割 ===
             if param_name == "qweight" and len(tensor.shape) == 2 and len(target_shape) == 2:
                 tensor_h, tensor_w = tensor.shape
                 target_h, target_w = target_shape
 
+                # MoE 专家层特殊处理
+                if is_moe_expert and tensor_h != target_h * tp_size:
+                    if tensor_h >= target_h:
+                        # Take the first slice for all TP ranks
+                        result = tensor[:target_h, :target_w].contiguous()
+                        return result
+
                 # 输入维度分割: tensor_h = target_h * tp_size
                 if tensor_h == target_h * tp_size and tensor_w == target_w:
                     start_idx = tp_rank * target_h
                     end_idx = start_idx + target_h
                     result = tensor[start_idx:end_idx, :].contiguous()
-                    logger.debug(f"TP split qweight by rows: rank {tp_rank} gets [{start_idx}:{end_idx}, :]")
                     return result
 
                 # 输出维度分割: tensor_w = target_w * tp_size
@@ -439,7 +434,6 @@ class GBALinearMethod(LinearMethodBase):
                     start_idx = tp_rank * target_w
                     end_idx = start_idx + target_w
                     result = tensor[:, start_idx:end_idx].contiguous()
-                    logger.debug(f"TP split qweight by cols: rank {tp_rank} gets [:, {start_idx}:{end_idx}]")
                     return result
 
                 # 需要广播: target_w = tensor_w * tp_size
@@ -448,7 +442,6 @@ class GBALinearMethod(LinearMethodBase):
                     start_idx = tp_rank * tensor_w
                     end_idx = start_idx + tensor_w
                     result[:, start_idx:end_idx] = tensor
-                    logger.debug(f"TP broadcast qweight: rank {tp_rank} fills [:, {start_idx}:{end_idx}]")
                     return result
 
             # === 2. scales 和 zeros: 按第一个维度分割 ===
@@ -456,12 +449,17 @@ class GBALinearMethod(LinearMethodBase):
                 tensor_h, tensor_w = tensor.shape
                 target_h, target_w = target_shape
 
-                # 🔧 修正: 按第一个维度分割 (group 维度)
+                # MoE 专家层特殊处理
+                if is_moe_expert and tensor_h > target_h:
+                    # 对于MoE专家，每个TP rank简单地取相同的第一个切片
+                    result = tensor[:target_h, :].contiguous()
+                    return result
+
+                # 按第一个维度分割 (group 维度)
                 if tensor_h == target_h * tp_size and tensor_w == target_w:
                     start_idx = tp_rank * target_h
                     end_idx = start_idx + target_h
                     result = tensor[start_idx:end_idx, :].contiguous()
-                    logger.debug(f"TP split {param_name} by rows: rank {tp_rank} gets [{start_idx}:{end_idx}, :]")
                     return result
 
                 # 输出维度分割: tensor_w = target_w * tp_size
@@ -469,7 +467,6 @@ class GBALinearMethod(LinearMethodBase):
                     start_idx = tp_rank * target_w
                     end_idx = start_idx + target_w
                     result = tensor[:, start_idx:end_idx].contiguous()
-                    logger.debug(f"TP split {param_name} by cols: rank {tp_rank} gets [:, {start_idx}:{end_idx}]")
                     return result
 
                 # 需要广播: target_w = tensor_w * tp_size
@@ -478,7 +475,6 @@ class GBALinearMethod(LinearMethodBase):
                     start_idx = tp_rank * tensor_w
                     end_idx = start_idx + tensor_w
                     result[:, start_idx:end_idx] = tensor
-                    logger.debug(f"TP broadcast {param_name}: rank {tp_rank} fills [:, {start_idx}:{end_idx}]")
                     return result
 
             # === 3. channel_scale: 按最后一个维度分割 ===
@@ -490,7 +486,6 @@ class GBALinearMethod(LinearMethodBase):
                     start_idx = tp_rank * target_d
                     end_idx = start_idx + target_d
                     result = tensor[:, :, start_idx:end_idx].contiguous()
-                    logger.debug(f"TP split channel_scale: rank {tp_rank} gets [:, :, {start_idx}:{end_idx}]")
                     return result
 
             # === 4. q_perm: 按唯一维度分割 ===
@@ -498,11 +493,17 @@ class GBALinearMethod(LinearMethodBase):
                 tensor_size = tensor.shape[0]
                 target_size = target_shape[0]
 
+                # MoE 专家层特殊处理
+                if is_moe_expert and tensor_size != target_size * tp_size:
+                    if tensor_size >= target_size:
+                        # Take the first slice for all TP ranks
+                        result = tensor[:target_size].contiguous()
+                        return result
+
                 if tensor_size == target_size * tp_size:
                     start_idx = tp_rank * target_size
                     end_idx = start_idx + target_size
                     result = tensor[start_idx:end_idx].contiguous()
-                    logger.debug(f"TP split q_perm: rank {tp_rank} gets [{start_idx}:{end_idx}]")
                     return result
 
             # === 5. q_groups: 用于 mixed bitwidth 模式 ===
@@ -510,33 +511,18 @@ class GBALinearMethod(LinearMethodBase):
                 tensor_size = tensor.shape[0]
                 target_size = target_shape[0]
 
+                # MoE 专家层特殊处理
+                if is_moe_expert and tensor_size != target_size * tp_size:
+                    if tensor_size >= target_size:
+                        # Take the first slice for all TP ranks
+                        result = tensor[:target_size].contiguous()
+                        return result
+
                 if tensor_size == target_size * tp_size:
                     start_idx = tp_rank * target_size
                     end_idx = start_idx + target_size
                     result = tensor[start_idx:end_idx].contiguous()
-                    logger.debug(f"TP split q_groups: rank {tp_rank} gets [{start_idx}:{end_idx}]")
                     return result
-
-            # 如果都不匹配，详细报错
-            logger.error(f"Cannot handle shape mismatch for {param_name}")
-            logger.error(f"  Param shape: {target_shape} ({target_shape.numel()} elements)")
-            logger.error(f"  Loaded shape: {tensor.shape} ({tensor.numel()} elements)")
-            logger.error(f"  TP size: {tp_size}, TP rank: {tp_rank}")
-
-            # 分析可能的分割方案
-            logger.error(f"  Analysis:")
-            for dim in range(len(tensor.shape)):
-                if len(target_shape) > dim:
-                    ratio = tensor.shape[dim] / target_shape[dim] if target_shape[dim] != 0 else float('inf')
-                    logger.error(f"    Dim {dim}: {tensor.shape[dim]} -> {target_shape[dim]} (ratio: {ratio:.2f})")
-
-                    # 检查是否是有效的TP分割
-                    if abs(ratio - tp_size) < 0.1:
-                        logger.error(f"      ✅ This dimension should be split by TP!")
-                    elif abs(ratio - 1.0) < 0.1:
-                        logger.error(f"      ✅ This dimension should remain the same")
-                    else:
-                        logger.error(f"      ❌ Unexpected ratio for TP splitting")
 
             raise ValueError(
                 f"Shape mismatch for {param_name}:\n"
@@ -551,9 +537,6 @@ class GBALinearMethod(LinearMethodBase):
             shaped_weight = ensure_shape(loaded_weight, param.shape, param_name)
             param.data.copy_(shaped_weight)
 
-            if tp_size > 1:
-                logger.info(f"GBA TP Success - Rank {tp_rank}: {param_name} loaded successfully")
-
         except Exception as e:
             logger.error(f"Failed to load weight {param_name}: {e}")
             raise e
@@ -563,7 +546,7 @@ class GBALinearMethod(LinearMethodBase):
 
         # Check if weights have been initialized
         if not hasattr(layer, '_gba_weights_initialized'):
-            logger.warning("GBA weights not properly initialized for layer")
+            logger.error("GBA weights not properly initialized for layer")
             return
 
         # Check if processing has already been done
@@ -775,59 +758,89 @@ class GBALinearMethod(LinearMethodBase):
 
     def _get_tp_strategy_from_prefix(self, layer_prefix: str) -> str:
         """
-        基于层前缀判断 TP 分割策略
+        基于层前缀和 GBA 特性判断 TP 分割策略
 
-        Args:
-            layer_prefix: 层的前缀名称，如 'model.layers.0.self_attn.q_proj'
-
-        Returns:
-            'column': Column parallel，按输出维度分割，需要 all_reduce
-            'row': Row parallel，按输入维度分割，不需要 all_reduce
+        GBA 量化的特殊处理：
+        - 对于 Column Parallel 层，如果权重已经按输出维度分割，则不需要 all_reduce
+        - 需要检查实际的权重分割情况
         """
 
-        # Column Parallel 层：按输出维度分割，需要 all_reduce
+        # 获取层引用来检查权重分割
+        layer = getattr(self, '_current_layer', None)
+
+        # Column Parallel 层：通常需要 all_reduce
         column_parallel_patterns = [
-            # Attention 相关的 query, key, value 投影
             'q_proj', 'k_proj', 'v_proj', 'qkv_proj',
-            # MLP 的输入投影
             'gate_proj', 'up_proj', 'gate_up_proj',
-            # MoE 专家网络的输入投影
             'experts.gate_proj', 'experts.up_proj'
         ]
 
-        # Row Parallel 层：按输入维度分割，不需要 all_reduce
+        # Row Parallel 层：通常不需要 all_reduce
         row_parallel_patterns = [
-            # Attention 的输出投影
-            'o_proj',
-            # MLP 的输出投影
-            'down_proj',
-            # MoE 专家网络的输出投影
-            'experts.down_proj'
+            'o_proj', 'down_proj', 'experts.down_proj'
         ]
 
-        # 检查是否匹配 Column Parallel 模式
+        # MoE Gate pattern (ReplicatedLinear)
+        moe_gate_patterns = [
+            'mlp.gate'
+        ]
+
+        for pattern in moe_gate_patterns:
+            if pattern in layer_prefix and 'experts' not in layer_prefix:
+                return 'replicated'
+
         for pattern in column_parallel_patterns:
             if pattern in layer_prefix:
+                if layer and hasattr(layer, 'qweight'):
+                    if self._check_gba_weight_splitting(layer, layer_prefix):
+                        return 'row'  # 返回 row 避免 all_reduce
                 return 'column'
 
         # 检查是否匹配 Row Parallel 模式
         for pattern in row_parallel_patterns:
             if pattern in layer_prefix:
                 return 'row'
+        return 'row'
 
-        return 'column'
+    def _check_gba_weight_splitting(self, layer, layer_prefix: str) -> bool:
+        """
+        检查 GBA 权重是否已经完整分割
+
+        返回 True 表示权重已经完整分割，不需要 all_reduce
+        """
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size <= 1:
+            return False
+
+        # 检查是否是融合层（如 qkv_proj, gate_up_proj）
+        if any(pattern in layer_prefix for pattern in ['qkv_proj', 'gate_up_proj']):
+            # 融合层通常需要 all_reduce
+            return False
+
+        # 对于普通的 column parallel 层，GBA 实现可能不需要 all_reduce
+        return True
 
     def _validate_and_adjust_input_for_tp(self, layer: torch.nn.Module, x: torch.Tensor,
                                           tp_size: int, tp_rank: int, strategy: str) -> torch.Tensor:
         """
-        验证输入维度并根据 TP 策略调整输入 - 修复版本
+        验证输入维度并根据 TP 策略调整输入
         """
+        if strategy == 'replicated':
+            return x.contiguous()
+
         expected_input_features = layer.qweight.size(0) * (32 // layer.weight_bits)
         current_input_features = x.size(-1)
+        layer_prefix = getattr(layer, '_layer_prefix', 'unknown')
 
-        logger.debug(f"TP Rank {tp_rank}: Input validation - "
-                     f"current={current_input_features}, expected={expected_input_features}, "
-                     f"strategy={strategy}")
+        # Special handling for MoE gate layers
+        if 'mlp.gate' in layer_prefix and strategy == 'column':
+            # MoE gate typically requires special handling
+            if current_input_features != expected_input_features:
+                # Try to adapt input for MoE gate
+                if current_input_features > expected_input_features:
+                    # We might have a larger input than expected, slice it
+                    adjusted_x = x[..., :expected_input_features].contiguous()
+                    return adjusted_x
 
         if strategy == 'column':
             # Column Parallel: 权重按输出维度分割，输入通常完整
@@ -839,13 +852,8 @@ class GBALinearMethod(LinearMethodBase):
                 start_idx = tp_rank * expected_input_features
                 end_idx = start_idx + expected_input_features
                 adjusted_x = x[..., start_idx:end_idx].contiguous()
-                logger.debug(f"TP Rank {tp_rank}: Column parallel input slicing [{start_idx}:{end_idx}]")
                 return adjusted_x
             else:
-                # 尝试其他可能的分割情况
-                logger.warning(f"TP Rank {tp_rank}: Unexpected input dimension for column parallel")
-                logger.warning(
-                    f"  current={current_input_features}, expected={expected_input_features}, tp_size={tp_size}")
                 # 直接返回，让 CUDA 层报错
                 return x.contiguous()
 
@@ -859,27 +867,12 @@ class GBALinearMethod(LinearMethodBase):
                 start_idx = tp_rank * expected_input_features
                 end_idx = start_idx + expected_input_features
                 adjusted_x = x[..., start_idx:end_idx].contiguous()
-                logger.debug(f"TP Rank {tp_rank}: Row parallel input slicing [{start_idx}:{end_idx}]")
                 return adjusted_x
             else:
-                logger.warning(f"TP Rank {tp_rank}: Unexpected input dimension for row parallel")
-                logger.warning(
-                    f"  current={current_input_features}, expected={expected_input_features}, tp_size={tp_size}")
                 return x.contiguous()
 
         else:
             raise ValueError(f"Unknown TP strategy: {strategy}")
-
-    def _check_tensor_validity(self, tensor: torch.Tensor, name: str, tp_rank: int) -> None:
-        """检查张量的有效性"""
-        if not tensor.is_contiguous():
-            logger.warning(f"TP Rank {tp_rank}: {name} tensor is not contiguous")
-
-        if torch.isnan(tensor).any():
-            logger.error(f"TP Rank {tp_rank}: {name} tensor contains NaN values")
-
-        if torch.isinf(tensor).any():
-            logger.error(f"TP Rank {tp_rank}: {name} tensor contains Inf values")
 
     def apply(
             self,
@@ -905,93 +898,61 @@ class GBALinearMethod(LinearMethodBase):
         if layer._has_channel_scale:
             x = x * layer._channel_scale_cached
 
-        # 获取 TP 信息
+        # Get TensorParallel info
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
 
-        # TP 策略判断和输入调整
-        needs_all_reduce = False
-        original_x_shape = x.shape
+        layer_prefix = getattr(layer, '_layer_prefix', 'unknown')
 
         if tp_size > 1:
-            layer_prefix = getattr(layer, '_layer_prefix', '')
-
-            # 判断 TP 策略
             tp_strategy = self._get_tp_strategy_from_prefix(layer_prefix)
-            needs_all_reduce = (tp_strategy == 'column')
+            needs_all_gather = (tp_strategy == 'column')
+            is_replicated = (tp_strategy == 'replicated')
 
-            # 验证输入张量
-            self._check_tensor_validity(x, "input", tp_rank)
+            if not is_replicated:
+                try:
+                    x = self._validate_and_adjust_input_for_tp(layer, x, tp_size, tp_rank, tp_strategy)
+                except Exception as e:
+                    logger.error(f"TP Rank {tp_rank}: Failed to adjust input for {layer_prefix}: {e}")
+                    raise e
 
-            # 验证和调整输入
-            try:
-                x = self._validate_and_adjust_input_for_tp(layer, x, tp_size, tp_rank, tp_strategy)
-                logger.debug(f"  Adjusted input shape: {x.shape}")
-            except Exception as e:
-                logger.error(f"TP Rank {tp_rank}: Failed to adjust input for {layer_prefix}: {e}")
-                raise e
-
-            # 最终验证
             if not x.is_contiguous():
-                logger.warning(f"TP Rank {tp_rank}: Input tensor is not contiguous after adjustment")
                 x = x.contiguous()
 
-        # 确保所有必要的张量都是 contiguous 的
-        if not layer.qweight.is_contiguous():
-            logger.warning(f"TP Rank {tp_rank}: qweight is not contiguous")
-        if not layer._scales_cached.is_contiguous():
-            logger.warning(f"TP Rank {tp_rank}: scales is not contiguous")
-        if not layer._zeros_cached.is_contiguous():
-            logger.warning(f"TP Rank {tp_rank}: zeros is not contiguous")
+        if tp_size > 1:
+            torch.cuda.synchronize()
 
-        try:
-            # 添加CUDA同步以确保内存操作完成
-            if tp_size > 1:
-                torch.cuda.synchronize()
+        output = ops.gba_linear_forward(
+            x,
+            layer.qweight,
+            layer._scales_cached,
+            layer._zeros_cached,
+            layer.q_perm,
+            layer.group_size,
+            layer.weight_bits,
+            self.quant_config.use_mbw,
+            layer._q_group_map_cached,
+            layer._rows_list_cached
+        )
 
-            output = ops.gba_linear_forward(
-                x,
-                layer.qweight,
-                layer._scales_cached,
-                layer._zeros_cached,
-                layer.q_perm,
-                layer.group_size,
-                layer.weight_bits,
-                self.quant_config.use_mbw,
-                layer._q_group_map_cached,
-                layer._rows_list_cached
-            )
+        if tp_size > 1:
+            torch.cuda.synchronize()
 
-            if tp_size > 1:
-                torch.cuda.synchronize()
+        if tp_size > 1 and needs_all_gather:
+            # Column Parallel needs concatenation
+            if any(pattern in layer_prefix for pattern in ['q_proj', 'k_proj', 'v_proj', 'gate_proj', 'up_proj']):
+                # concatenate
+                gathered = tensor_model_parallel_all_gather(output)
 
-        except RuntimeError as e:
-            if tp_size > 1:
-                layer_prefix = getattr(layer, '_layer_prefix', 'unknown')
-                logger.error(f"TP CUDA Error - Rank {tp_rank}, Layer {layer_prefix}: {e}")
-                logger.error(f"  Input shape: {x.shape}")
-                logger.error(f"  Input contiguous: {x.is_contiguous()}")
-                logger.error(f"  Input device: {x.device}")
-                logger.error(f"  Input dtype: {x.dtype}")
-                logger.error(f"  qweight shape: {layer.qweight.shape}")
-                logger.error(f"  qweight contiguous: {layer.qweight.is_contiguous()}")
-                logger.error(f"  Expected input features: {layer.qweight.size(0) * (32 // layer.weight_bits)}")
-                logger.error(f"  TP strategy: {tp_strategy if 'tp_strategy' in locals() else 'unknown'}")
-
-                # 添加内存诊断
-                logger.error(f"  GPU memory allocated: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
-                logger.error(f"  GPU memory cached: {torch.cuda.memory_reserved() / 1024 ** 3:.2f} GB")
-            raise e
-
-        # 根据策略决定是否进行 all_reduce
-
-        DISABLE_ALL_REDUCE_FOR_TEST = True
-
-        if tp_size > 1 and needs_all_reduce and not DISABLE_ALL_REDUCE_FOR_TEST:
-            layer_prefix = getattr(layer, '_layer_prefix', 'unknown')
-            logger.debug(f"Performing all_reduce for {layer_prefix}")
-
-            output = tensor_model_parallel_all_reduce(output)
+                # 沿最后一个维度 concatenate
+                if len(gathered.shape) == 4:  # [tp_size, batch, seq, hidden]
+                    output = gathered.permute(1, 2, 0, 3).contiguous().view(
+                        output.shape[0], output.shape[1], -1
+                    )
+                elif len(gathered.shape) == 3:  # [tp_size, tokens, hidden]
+                    output = gathered.permute(1, 0, 2).contiguous().view(
+                        output.shape[0], -1
+                    )
 
         if bias is not None:
             output = output + bias
